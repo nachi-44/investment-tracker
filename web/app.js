@@ -226,20 +226,65 @@ async function openVault(store, session, sha) {
   await cacheVault();
   renderApp();
   syncWatchlist().catch(() => {});
+  livePrices();
 }
 
-/** Pull the daily price job's output (public market data) and apply it in memory. */
+/** Read the price job's output (public market data) and apply it in memory. Returns the file's sha. */
 async function refreshPrices() {
   try {
     const [latest, hist] = await Promise.all([S.store.read("prices/latest.json"), S.store.read("prices/history.csv")]);
     if (latest) {
       const r = mergePrices(S.vault.db, JSON.parse(latest.text));
       S.vault.db = r.db;
-      S.prices = { updated: r.updated, applied: r.applied, misses: r.misses };
+      S.prices = { updated: r.updated, applied: r.applied, misses: r.misses, lastQuote: r.lastQuote, sha: latest.sha };
     }
     if (hist) S.hist = parseHistory(hist.text);
-  } catch (e) { S.prices = { error: e.message }; }
+    return latest?.sha || null;
+  } catch (e) { S.prices = { ...(S.prices || {}), error: e.message }; return null; }
 }
+
+const LIVE_MAX_AGE = 15 * 60 * 1000; // quotes from free sources are up to ~15 min delayed anyway
+const LIVE_TIMEOUT = 150 * 1000;
+
+/**
+ * Ask GitHub to run the price job now, then wait for its result (about 30–60 s).
+ * Automatic on unlock and when the app comes back to the foreground, if prices are older than 15 minutes.
+ */
+async function livePrices({ force = false } = {}) {
+  if (S.demo || S.offline || !S.store?.dispatch || S.pricesBusy) return;
+  const age = S.prices?.updated ? Date.now() - Date.parse(S.prices.updated) : Infinity;
+  if (!force && age < LIVE_MAX_AGE) return;
+  S.pricesBusy = true; S.pricesError = null; drawStatus();
+  const before = S.prices?.sha || null;
+  try {
+    await S.store.dispatch("prices.yml");
+    const t0 = Date.now();
+    let sha = before;
+    while (sha === before && Date.now() - t0 < LIVE_TIMEOUT) {
+      await new Promise((r) => setTimeout(r, 8000));
+      if (!S.vault) return; // locked meanwhile
+      sha = (await S.store.read("prices/latest.json"))?.sha || null;
+    }
+    if (sha === before) throw new Error("The price job is taking longer than usual. Prices will update on the next refresh.");
+    await refreshPrices();
+    await cacheVault();
+    toast(`Prices updated (${timeOf(S.prices.lastQuote || S.prices.updated)}).`);
+  } catch (e) { S.pricesError = e.message; toast(e.message); }
+  finally {
+    S.pricesBusy = false;
+    if (S.vault) S.view === "record" ? drawStatus() : renderApp();
+  }
+}
+const timeOf = (iso) => (iso ? new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "–");
+const dayTime = (iso) => {
+  if (!iso) return "–";
+  const d = new Date(iso), same = d.toDateString() === new Date().toDateString();
+  return same ? `today ${timeOf(iso)}` : d.toLocaleDateString([], { day: "numeric", month: "short" }) + " " + timeOf(iso);
+};
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && S.vault && !S.demo) livePrices();
+});
 
 /** Keep watchlist.json (identifiers only) in step with the positions, so the price job knows what to fetch. */
 async function syncWatchlist() {
@@ -277,17 +322,34 @@ const VIEWS = [["overview", "Overview"], ["holdings", "Holdings"], ["record", "R
 function renderApp() {
   const db = S.vault.db;
   const R = rows(db), T = totals(db, R);
-  const status = S.demo ? "Demo · sample data, nothing is saved"
-    : S.offline ? "Offline · read only"
-    : S.savedAt ? `Synced ${S.savedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : "";
   const top = h("header.top", h("div.page",
-    h("h1", "Portfolio"), h("div.status" + (S.offline ? ".err" : ""), h("div", money(T.value)), h("div", status))));
+    h("h1", "Portfolio"), h("div.status#status"), h("button.btn.icon#refresh", {
+      title: "Refresh prices now", "aria-label": "Refresh prices now", hidden: S.demo || S.offline,
+      on: { click: () => livePrices({ force: true }) },
+    }, "↻")));
   const tabs = h("nav.tabs", { role: "tablist" }, VIEWS.map(([id, label]) =>
     h("button", { role: "tab", "aria-selected": String(S.view === id), on: { click: () => { S.view = id; renderApp(); scrollTo(0, 0); } } }, label)));
   const main = h("main.page");
   ({ overview, holdings, record, plan, settings })[S.view](main, db, R, T);
   main.append(h("footer", "Facts about your holdings, calculated from your own rules. Not financial advice."));
   clear(root).append(top, tabs, main);
+  drawStatus();
+}
+
+/** Header status: total value plus how fresh the prices are. Redrawn without touching the open view. */
+function drawStatus() {
+  const el = document.getElementById("status");
+  if (!el || !S.vault) return;
+  const T = totals(S.vault.db);
+  const line2 = S.demo ? "Demo · sample data, nothing is saved"
+    : S.offline ? "Offline · read only"
+    : S.pricesBusy ? "Updating prices…"
+    : S.prices?.updated ? `Prices ${dayTime(S.prices.lastQuote || S.prices.updated)}`
+    : "No prices fetched yet";
+  el.className = "status" + (S.offline || S.pricesError ? " err" : "");
+  clear(el).append(h("div", money(T.value)), h("div", line2));
+  const btn = document.getElementById("refresh");
+  if (btn) { btn.disabled = !!S.pricesBusy; btn.classList.toggle("spin", !!S.pricesBusy); }
 }
 
 // ---------- overview ----------
@@ -309,8 +371,9 @@ function overview(m, db, R, T) {
     h("div.card", h("h3", "Largest positions"), bars(top, (v) => ((v / T.value) * 100).toFixed(1) + "%", () => "var(--c1)")),
     h("div.card", h("h3", "Gains and losses (known cost only)"), gl.length ? bars(gl, (v) => pct(v, true), (v) => (v >= 0 ? "var(--gain)" : "var(--loss)")) : h("p.mu.sm", "None yet.")),
     h("div.card", h("h3", "Value over time"), line(S.hist ? valueSeries(db, S.hist) : [], (v) => money(v, "EUR", 0)))));
-  if (S.prices?.updated) m.append(h("p.sm.mu", `Prices from the daily job: ${new Date(S.prices.updated).toLocaleString()}.` + (S.prices.misses?.length ? ` Not found: ${S.prices.misses.join(", ")}.` : "")));
-  else if (!S.demo) m.append(h("p.sm.mu", S.prices?.error ? `Prices could not be loaded: ${S.prices.error}` : "No daily prices yet. They appear after the price job's first run."));
+  if (S.prices?.updated) m.append(h("p.sm.mu", `Stocks, ETFs and exchange rates: latest quotes, as of ${dayTime(S.prices.lastQuote || S.prices.updated)} (free sources can be up to 15 minutes delayed). Mutual funds and the ULIP have one price per day.` + (S.prices.misses?.length ? ` Not found: ${S.prices.misses.join(", ")}.` : "")));
+  else if (!S.demo) m.append(h("p.sm.mu", S.prices?.error ? `Prices could not be loaded: ${S.prices.error}` : "No prices yet. Tap ↻ to fetch them (takes about a minute)."));
+  if (S.pricesError) m.append(h("p.note", S.pricesError));
 }
 function tile(label, value, c = "", sub = "") { return h("div", h("span", label), h("b" + (c ? "." + c : ""), value), sub && h("span", sub)); }
 
@@ -356,7 +419,7 @@ function item(r, db) {
     el.append(h("div.detail",
       h("div.kv",
         kv("Quantity", r.qty.toLocaleString("en-US", { maximumFractionDigits: 4 })), kv("Avg cost", money(r.avg, r.ccy)),
-        kv("Price", money(r.price, r.ccy)), kv("Price date", (r.price_date || "unknown") + (r.price_src ? ` (${r.price_src})` : "")),
+        kv("Price", money(r.price, r.ccy)), kv("Price as of", (r.price_time ? dayTime(r.price_time) : r.price_date || "unknown") + (r.price_src ? ` (${r.price_src})` : "")),
         kv("Value", money(r.val, r.ccy)), kv("Invested", money(r.cost, r.ccy)),
         kv("ISIN", r.isin || "–"), kv("Held since", r.firstDate || "unknown")),
       r.lots.length > 1 && h("details", h("summary.sm", `${r.lots.length} purchase lots (FIFO)`), h("div.scroll", h("table.mini",

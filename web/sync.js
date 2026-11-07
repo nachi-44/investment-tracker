@@ -51,6 +51,14 @@ export class GitHubStore {
     if (!res.ok) throw new Error(`GitHub save failed (${res.status}).`);
     return (await res.json()).content.sha;
   }
+  /** Start a workflow run (needs the token permission "Actions: read and write"). */
+  async dispatch(workflow) {
+    let res;
+    try { res = await this.req("POST", `actions/workflows/${workflow}/dispatches`, { ref: this.branch }); }
+    catch (e) { if (e instanceof AuthError) throw new AuthError("The token can't start the price job. Add the permission 'Actions: Read and write' for the vault repository."); throw e; }
+    if (res.status === 404) throw new Error("Price workflow not found in the vault repository.");
+    if (res.status !== 204 && !res.ok) throw new Error(`Could not start the price job (${res.status}).`);
+  }
 }
 
 /** In-memory store with the same interface (tests and the local demo). */
@@ -64,6 +72,7 @@ export class MemoryStore {
     this.files[path] = { text, sha: nsha };
     return nsha;
   }
+  async dispatch(workflow) { this.dispatched = (this.dispatched || []).concat(workflow); if (this.onDispatch) await this.onDispatch(workflow); }
 }
 
 export const VAULT_PATH = "portfolio.enc";

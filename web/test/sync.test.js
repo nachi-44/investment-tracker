@@ -59,3 +59,13 @@ test("GitHubStore maps HTTP codes and encodes content", async () => {
   const denied = new GitHubStore({ owner: "o", repo: "r", token: "t", fetchFn: async () => ({ status: 401, ok: false }) });
   await assert.rejects(() => denied.read("x"), /refused access/);
 });
+
+test("dispatch starts the price workflow; missing permission gives a clear message", async () => {
+  let call;
+  const ok = new GitHubStore({ owner: "o", repo: "r", token: "t", fetchFn: async (url, init) => { call = { url, init }; return { status: 204, ok: true }; } });
+  await ok.dispatch("prices.yml");
+  assert.ok(call.url.endsWith("/repos/o/r/actions/workflows/prices.yml/dispatches"));
+  assert.eq(JSON.parse(call.init.body).ref, "main");
+  const no = new GitHubStore({ owner: "o", repo: "r", token: "t", fetchFn: async () => ({ status: 403, ok: false }) });
+  await assert.rejects(() => no.dispatch("prices.yml"), /Actions: Read and write/);
+});

@@ -4,8 +4,8 @@ A private, encrypted portfolio dashboard for PC and phone. It combines Degiro (E
 
 - **Zero-knowledge:** holdings are encrypted in your browser (AES-256-GCM, PBKDF2 600k). Only ciphertext is stored, in a *private* GitHub repo.
 - **Works on the phone:** installable from the browser ("Add to Home Screen"), with read-only offline access.
-- **Automatic prices:** a daily job fetches public data and never sees your holdings:
-  - ECB exchange rates
+- **Current prices when you open it:** opening the app (or tapping ↻) starts the price job on GitHub. About a minute later the app shows prices "as of" that time. Stocks, ETFs and FX are live to about 15 minutes; mutual funds and the ULIP have one price per day. A scheduled run also happens twice a weekday. The job uses public data only and never sees your holdings:
+  - ECB and Yahoo exchange rates
   - AMFI mutual fund NAVs
   - Yahoo/Stooq quotes for stocks and ETFs
 - **Record on the move:** buy, sell, ULIP payment, manual price, Degiro `Portfolio.csv` import. If two devices edit at once, both edits are kept.
@@ -25,7 +25,7 @@ No build step, no dependencies: plain ES modules in `web/`.
 1. **GitHub security:** keep your 2FA and add a passkey (Settings → Password and authentication). Store your recovery codes safely.
 2. **Access token:** go to Settings → Developer settings → Fine-grained tokens → Generate.
    - Repository access: *Only select repositories* → `investment-vault`.
-   - Permissions: *Contents: Read and write*.
+   - Permissions: *Contents: Read and write* and *Actions: Read and write* (Actions lets the app start the price job when you open it).
    - Expiration: 1 year.
 3. Open the app (the GitHub Pages URL). Enter `nachi-44/investment-vault` and the token, leave the passphrase empty, and press **Connect**.
 4. Choose your private `seed.json` (same format as `web/seed.example.json`) and set a passphrase of 5+ random words. **Save the recovery key** it shows.

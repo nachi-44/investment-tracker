@@ -33,6 +33,7 @@ The goal is one dashboard on PC and phone, quick recording on the move, and rule
   - The data key (AES-GCM-256) is wrapped by the passphrase (PBKDF2-SHA256, 600k) and by a recovery key (Crockford base32, shown once).
   - The GitHub token is stored on the device, sealed with the data key.
 - `sync.js`: `GitHubStore` (Contents API with sha; 409/422 → `ConflictError`), `MemoryStore` (tests and `#demo`), and `Vault` (commit → on conflict re-read, replay pending ops, retry).
+- **Price refresh on demand:** on unlock, on return to the foreground (if prices are older than 15 minutes) and on the ↻ button, the app calls `GitHubStore.dispatch("prices.yml")`. The token needs *Actions: read and write*. The app then polls `prices/latest.json` every 8 s, for up to 150 s, until its sha changes. Quotes carry `time`, and positions get `price_time`. Intraday runs overwrite that day's line in `history.csv`, so the last run of the day keeps the close. Option for later: a Cloudflare Worker for instant quotes (the user is open to it if the ~1 min wait is annoying).
 - `prices.js`: builds `watchlist`, merges `prices/latest.json` in memory (converted to the account currency; a newer manual price wins), and computes `valueSeries` from `prices/history.csv`.
 - `rules.js`: X-ray checks, allocation with 5/25 bands, new-money split.
 - `scripts/fetch-prices.mjs`: runs in the vault repo (`vault-template/.github/workflows/prices.yml`). Sources:

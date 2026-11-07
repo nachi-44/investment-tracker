@@ -39,10 +39,12 @@ export function mergePrices(db, latest) {
     if (from == null || to == null) continue;
     p.price = (q.price * from) / to;
     p.price_date = q.date;
+    p.price_time = q.time || null;
     p.price_src = q.src;
     applied++;
   }
-  return { db: out, applied, misses: latest.misses || [], updated: latest.updated };
+  const times = Object.values(latest.quotes || {}).map((q) => q.time).filter(Boolean).sort();
+  return { db: out, applied, misses: latest.misses || [], updated: latest.updated, lastQuote: times.at(-1) || null };
 }
 
 export function parseHistory(csv) {
