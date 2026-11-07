@@ -1,0 +1,18 @@
+{
+ "rates": {"INR": 0.0105},
+ "accounts": {
+  "degiro": {"name": "Degiro", "ccy": "EUR"},
+  "india": {"name": "India", "ccy": "INR"},
+  "ulip": {"name": "SBI Life ULIP", "ccy": "INR"}
+ },
+ "positions": [
+  {"acct": "degiro", "sym": "Example Stock A", "isin": "US0000000001", "cls": "Stock", "qty": 10, "cost": 1000.0, "price": 120.0},
+  {"acct": "degiro", "sym": "Example World ETF", "isin": "IE0000000001", "cls": "ETF", "qty": 20, "cost": 2000.0, "price": 105.0},
+  {"acct": "degiro", "sym": "Example Gold ETC", "isin": "DE0000000002", "cls": "Gold", "qty": 15, "cost": 900.0, "price": 78.0},
+  {"acct": "degiro", "sym": "CASH EUR", "isin": "", "cls": "Cash", "qty": 500.0, "cost": 500.0, "price": 1.0},
+  {"acct": "india", "sym": "Example Index Fund", "isin": "INF000000001", "cls": "Equity fund", "qty": 1000.0, "cost": 100000.0, "price": 110.0},
+  {"acct": "india", "sym": "Example Debt Fund", "isin": "INF000000002", "cls": "Debt fund", "qty": 2000.0, "cost": 60000.0, "price": 31.5},
+  {"acct": "india", "sym": "Example Bank Shares", "isin": "INE000000001", "cls": "Stock", "qty": 100, "cost": 30000.0, "price": 300.0, "est": true},
+  {"acct": "ulip", "sym": "Example ULIP", "isin": "", "cls": "Insurance (ULIP)", "qty": 1, "cost": 300000, "price": 290000.0}
+ ]
+}

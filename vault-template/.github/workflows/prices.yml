@@ -1,0 +1,33 @@
+# Lives in the PRIVATE vault repo. Fetches public prices for the identifiers in watchlist.json.
+# It has no passphrase and never decrypts portfolio.enc.
+name: Daily prices
+on:
+  schedule:
+    - cron: "30 18 * * 1-5"   # 18:30 UTC on weekdays: after Xetra close; AMFI NAVs are usually out by then
+    - cron: "30 3 * * 2-6"    # 03:30 UTC: picks up late AMFI NAVs and US closes
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: prices
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get the price script from the public app repo (pinned to main)
+        run: curl -fsSL https://raw.githubusercontent.com/nachi-44/investment-tracker/main/scripts/fetch-prices.mjs -o /tmp/fetch-prices.mjs
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Fetch prices
+        run: |
+          if [ ! -f watchlist.json ]; then echo "No watchlist.json yet (open the app once)."; exit 0; fi
+          node /tmp/fetch-prices.mjs .
+      - name: Commit
+        run: |
+          git config user.name "price-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add prices
+          git diff --cached --quiet || git commit -m "prices" -q
+          for i in 1 2 3; do git pull --rebase -q && git push -q && break; sleep 5; done

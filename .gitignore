@@ -1,0 +1,15 @@
+# Real holdings never go into this (public) repo.
+data/
+seed.json
+*.csv
+!web/test/**/*.csv
+*.pdf
+*.enc
+portfolio.json
+.env*
+__pycache__/
+.venv/
+node_modules/
+.DS_Store
+Thumbs.db
+.claude/settings.local.json

@@ -1,0 +1,599 @@
+// App shell: connect / unlock, views, auto-lock. All data handling goes through core.js, vault.js and sync.js.
+import { h, clear, cls, toast, donut, bars, line } from "./ui.js";
+import { migrate, rows, totals, groupBy, facets, filterRows, sortRows, money, pct, num, today, findPos } from "./core.js";
+import { createVault, unlock, recover, changePassphrase, encryptData, decryptData, sealSecret, openSecret, passphraseProblem } from "./vault.js";
+import { GitHubStore, MemoryStore, Vault, VAULT_PATH, AuthError } from "./sync.js";
+import { degiroPortfolioOp } from "./importers/degiro.js";
+import { checks, allocation, splitNewMoney } from "./rules.js";
+import * as folder from "./folder.js";
+import { watchlist, mergePrices, parseHistory, valueSeries } from "./prices.js";
+
+const DEVICE_KEY = "pt.device.v1";
+const IDLE_MS = 5 * 60 * 1000;
+const root = document.getElementById("app");
+
+const S = {
+  device: readDevice(),
+  session: null, vault: null, store: null,
+  view: "overview", filters: {}, sort: "valEUR:-1", openRows: new Set(),
+  offline: false, demo: false, savedAt: null, recordPrefill: null,
+};
+
+// ---------- device storage (only encrypted things + repo name) ----------
+function readDevice() { try { return JSON.parse(localStorage.getItem(DEVICE_KEY)) || null; } catch { return null; } }
+function writeDevice(d) { S.device = d; try { d ? localStorage.setItem(DEVICE_KEY, JSON.stringify(d)) : localStorage.removeItem(DEVICE_KEY); } catch {} }
+async function cacheVault() {
+  if (S.demo || !S.vault) return;
+  const file = await encryptData(S.session, S.vault.db);
+  writeDevice({ ...S.device, cache: { text: JSON.stringify(file), sha: S.vault.sha } });
+}
+
+// ---------- theme ----------
+function applyTheme() {
+  let t = "auto"; try { t = localStorage.getItem("pt.theme") || "auto"; } catch {}
+  if (t === "auto") document.documentElement.removeAttribute("data-theme"); else document.documentElement.dataset.theme = t;
+}
+applyTheme();
+
+// ---------- auto-lock ----------
+let lastActive = Date.now();
+for (const ev of ["pointerdown", "keydown", "scroll"]) addEventListener(ev, () => (lastActive = Date.now()), { passive: true });
+setInterval(() => { if (S.session && !S.demo && Date.now() - lastActive > IDLE_MS) lock("Locked after 5 minutes without activity."); }, 15000);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && S.session && !S.demo && Date.now() - lastActive > IDLE_MS) lock("Locked after 5 minutes without activity.");
+});
+
+function lock(msg) {
+  S.session = null; S.vault = null; S.store = null; S.openRows.clear();
+  if (S.demo) { location.hash = ""; S.demo = false; }
+  boot(msg);
+}
+
+// ---------- boot ----------
+function boot(msg) {
+  if (location.hash === "#demo") return startDemo();
+  if (!S.device) return renderConnect(msg);
+  return renderLock(msg);
+}
+
+function screen(...kids) { clear(root).append(h("div.center", ...kids)); }
+function field(lbl, input, hint) {
+  if (!input.id) input.id = "f" + Math.random().toString(36).slice(2, 8);
+  return h("div.field", h("label", { for: input.id }, lbl), input, hint && h("div.sm.mu", hint));
+}
+function busy(btn, on, text) { btn.disabled = on; if (text) btn.textContent = text; }
+const errBox = () => h("div.err", { role: "alert" });
+
+// ---------- connect (first time on this device) ----------
+function renderConnect(msg) {
+  const repo = h("input", { value: "nachi-44/investment-vault", autocomplete: "off", spellcheck: false });
+  const token = h("input", { type: "password", autocomplete: "off", placeholder: "github_pat_…" });
+  const pass = h("input", { type: "password", autocomplete: "current-password" });
+  const err = errBox();
+  const go = h("button.btn.primary", { type: "submit" }, "Connect");
+  const form = h("form", {
+    on: {
+      submit: async (e) => {
+        e.preventDefault(); err.textContent = "";
+        const [owner, name] = repo.value.trim().split("/");
+        if (!owner || !name) return (err.textContent = "Enter the vault repository as owner/name.");
+        if (!token.value.trim()) return (err.textContent = "Enter the access token.");
+        busy(go, true, "Connecting…");
+        try {
+          const store = new GitHubStore({ owner, repo: name, token: token.value.trim() });
+          const f = await store.read(VAULT_PATH);
+          if (!f) return renderCreate(store, { owner, repo: name, token: token.value.trim() });
+          if (!pass.value) throw new Error("Enter your passphrase to unlock the existing vault.");
+          const session = await unlock(JSON.parse(f.text), pass.value);
+          writeDevice({ owner, repo: name, tokenBox: await sealSecret(session, token.value.trim()) });
+          await openVault(store, session);
+        } catch (e2) { err.textContent = e2.message; busy(go, false, "Connect"); }
+      },
+    },
+  },
+    field("Vault repository (private)", repo),
+    field("Fine-grained access token", token, "Only for the vault repository, permission Contents: read and write. Stored on this device encrypted with your passphrase."),
+    field("Passphrase", pass, "Leave empty if you are creating a new vault."),
+    err, h("div.row", go, h("a.sm", { href: "#demo", on: { click: () => setTimeout(() => boot(), 0) } }, "Try with sample data")));
+  screen(h("h1", "Connect this device"), msg && h("p.note", msg), h("div.card", form), privacyNote());
+}
+
+function privacyNote() {
+  return h("p.sm.mu", "Your holdings are encrypted in this browser before anything is sent to GitHub. The passphrase never leaves this device. Not financial advice.");
+}
+
+// ---------- create a new vault from seed.json ----------
+function renderCreate(store, conn) {
+  const file = h("input", { type: "file", accept: ".json,application/json" });
+  const p1 = h("input", { type: "password", autocomplete: "new-password" });
+  const p2 = h("input", { type: "password", autocomplete: "new-password" });
+  const err = errBox();
+  const go = h("button.btn.primary", { type: "submit" }, "Create encrypted vault");
+  const form = h("form", {
+    on: {
+      submit: async (e) => {
+        e.preventDefault(); err.textContent = "";
+        const problem = passphraseProblem(p1.value);
+        if (problem) return (err.textContent = problem);
+        if (p1.value !== p2.value) return (err.textContent = "The passphrases don't match.");
+        if (!file.files[0]) return (err.textContent = "Choose your seed.json file.");
+        busy(go, true, "Encrypting…");
+        try {
+          const data = migrate(JSON.parse(await file.files[0].text()));
+          if (!Object.keys(data.accounts).length || !Array.isArray(data.positions)) throw new Error("seed.json needs accounts and positions.");
+          const { file: vf, session, recovery } = await createVault(p1.value, data);
+          const sha = await store.write(VAULT_PATH, JSON.stringify(vf), null, "create vault");
+          writeDevice({ owner: conn.owner, repo: conn.repo, tokenBox: await sealSecret(session, conn.token) });
+          renderRecovery(recovery, () => openVault(store, session, sha));
+        } catch (e2) { err.textContent = e2.message; busy(go, false, "Create encrypted vault"); }
+      },
+    },
+  },
+    field("Your seed.json (stays on this device; only the encrypted result is uploaded)", file),
+    field("New passphrase", p1, "At least 5 random words, or 16+ varied characters."),
+    field("Repeat passphrase", p2), err, go);
+  screen(h("h1", "Create your vault"), h("p.mu", "No vault exists in this repository yet."), h("div.card", form), privacyNote());
+}
+
+function renderRecovery(code, next) {
+  const ok = h("input", { type: "checkbox", id: "saved" });
+  const go = h("button.btn.primary", { disabled: true, on: { click: next } }, "Continue");
+  ok.addEventListener("change", () => (go.disabled = !ok.checked));
+  screen(h("h1", "Save your recovery key"),
+    h("div.card",
+      h("p", "If you forget your passphrase, this key is the only way back in. Store it in your password manager or print it. It is shown only once."),
+      h("div.recovery", code),
+      h("p.row", h("button.btn", { on: { click: () => navigator.clipboard?.writeText(code).then(() => toast("Copied")) } }, "Copy")),
+      h("p.row", ok, h("label", { for: "saved" }, "I have saved the recovery key")), go));
+}
+
+// ---------- unlock (device already connected) ----------
+function renderLock(msg) {
+  const pass = h("input", { type: "password", autocomplete: "current-password", autofocus: true });
+  const err = errBox();
+  const go = h("button.btn.primary", { type: "submit" }, "Unlock");
+  const form = h("form", {
+    on: {
+      submit: async (e) => {
+        e.preventDefault(); err.textContent = "";
+        busy(go, true, "Unlocking…");
+        try {
+          const d = S.device;
+          const cached = d.cache ? JSON.parse(d.cache.text) : null;
+          let session, token;
+          if (cached) {
+            session = await unlock(cached, pass.value);
+            token = await openSecret(session, d.tokenBox);
+          } else {
+            // no cache yet: we need the file from GitHub, but the token is sealed with the data key.
+            throw new Error("This device has no saved copy. Use 'Forget this device' and connect again.");
+          }
+          const store = new GitHubStore({ owner: d.owner, repo: d.repo, token });
+          await openVault(store, session).catch(async (e3) => {
+            if (e3 instanceof AuthError) throw e3;
+            // offline: open the cached copy read-only
+            S.offline = true;
+            S.store = store; S.session = session;
+            S.vault = new Vault(store, session);
+            S.vault.db = migrate(await decryptData(cached, session)); S.vault.sha = d.cache.sha;
+            renderApp();
+            toast("Offline: showing your last saved copy (read only).");
+          });
+        } catch (e2) { err.textContent = e2.message; busy(go, false, "Unlock"); pass.select(); }
+      },
+    },
+  }, field("Passphrase", pass), err, h("div.row", go,
+    h("button.btn", { type: "button", on: { click: () => renderRecover() } }, "Use recovery key")));
+  screen(h("h1", "Portfolio"), msg && h("p.note.ok", msg), h("div.card", form),
+    h("p.sm", h("a", { href: "#", on: { click: (e) => { e.preventDefault(); if (confirm("Remove the saved connection and encrypted copy from this device? Your vault on GitHub is not affected.")) { writeDevice(null); boot(); } } } }, "Forget this device")),
+    privacyNote());
+  pass.focus();
+}
+
+function renderRecover() {
+  const code = h("input", { autocomplete: "off", spellcheck: false, placeholder: "XXXX-XXXX-…" });
+  const p1 = h("input", { type: "password", autocomplete: "new-password" });
+  const err = errBox();
+  const go = h("button.btn.primary", { type: "submit" }, "Reset passphrase");
+  const form = h("form", {
+    on: {
+      submit: async (e) => {
+        e.preventDefault(); err.textContent = ""; busy(go, true, "Working…");
+        try {
+          const d = S.device, cached = JSON.parse(d.cache.text);
+          const r0 = await recover(cached, code.value, p1.value);
+          const token = await openSecret(r0.session, d.tokenBox);
+          const store = new GitHubStore({ owner: d.owner, repo: d.repo, token });
+          const f = await store.read(VAULT_PATH);
+          const r = await recover(JSON.parse(f.text), code.value, p1.value);
+          await store.write(VAULT_PATH, JSON.stringify(r.file), f.sha, "update");
+          await openVault(store, r.session);
+          toast("New passphrase set.");
+        } catch (e2) { err.textContent = e2.message; busy(go, false, "Reset passphrase"); }
+      },
+    },
+  }, field("Recovery key", code), field("New passphrase", p1, "At least 5 random words, or 16+ varied characters."), err,
+    h("div.row", go, h("button.btn", { type: "button", on: { click: () => renderLock() } }, "Back")));
+  screen(h("h1", "Recover access"), h("div.card", form));
+}
+
+async function openVault(store, session, sha) {
+  const v = new Vault(store, session);
+  await v.load();
+  if (sha && !v.sha) v.sha = sha;
+  Object.assign(S, { store, session, vault: v, offline: false, savedAt: new Date() });
+  await refreshPrices();
+  await cacheVault();
+  renderApp();
+  syncWatchlist().catch(() => {});
+}
+
+/** Pull the daily price job's output (public market data) and apply it in memory. */
+async function refreshPrices() {
+  try {
+    const [latest, hist] = await Promise.all([S.store.read("prices/latest.json"), S.store.read("prices/history.csv")]);
+    if (latest) {
+      const r = mergePrices(S.vault.db, JSON.parse(latest.text));
+      S.vault.db = r.db;
+      S.prices = { updated: r.updated, applied: r.applied, misses: r.misses };
+    }
+    if (hist) S.hist = parseHistory(hist.text);
+  } catch (e) { S.prices = { error: e.message }; }
+}
+
+/** Keep watchlist.json (identifiers only) in step with the positions, so the price job knows what to fetch. */
+async function syncWatchlist() {
+  if (S.demo || S.offline) return;
+  const want = JSON.stringify(watchlist(S.vault.db), null, 1) + "\n";
+  const cur = await S.store.read("watchlist.json");
+  if (cur?.text === want) return;
+  await S.store.write("watchlist.json", want, cur?.sha || null, "update");
+}
+
+async function startDemo() {
+  S.demo = true;
+  const seed = migrate(await (await fetch("seed.example.json")).json());
+  const { file, session } = await createVault("demo demo demo demo demo", seed, { iterations: 1000 });
+  const store = new MemoryStore({ [VAULT_PATH]: { text: JSON.stringify(file), sha: "m0" } });
+  const v = new Vault(store, session); await v.load();
+  Object.assign(S, { store, session, vault: v, offline: false, savedAt: null });
+  renderApp();
+}
+
+// ---------- commit helper ----------
+async function commit(op, okMsg) {
+  if (S.offline) throw new Error("You're offline. Reconnect to save changes.");
+  const res = await S.vault.commit(op);
+  S.savedAt = new Date();
+  await cacheVault();
+  syncWatchlist().catch(() => {});
+  if (okMsg) toast(okMsg);
+  return res;
+}
+
+// ---------- app shell ----------
+const VIEWS = [["overview", "Overview"], ["holdings", "Holdings"], ["record", "Record"], ["plan", "Plan"], ["settings", "Settings"]];
+
+function renderApp() {
+  const db = S.vault.db;
+  const R = rows(db), T = totals(db, R);
+  const status = S.demo ? "Demo · sample data, nothing is saved"
+    : S.offline ? "Offline · read only"
+    : S.savedAt ? `Synced ${S.savedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : "";
+  const top = h("header.top", h("div.page",
+    h("h1", "Portfolio"), h("div.status" + (S.offline ? ".err" : ""), h("div", money(T.value)), h("div", status))));
+  const tabs = h("nav.tabs", { role: "tablist" }, VIEWS.map(([id, label]) =>
+    h("button", { role: "tab", "aria-selected": String(S.view === id), on: { click: () => { S.view = id; renderApp(); scrollTo(0, 0); } } }, label)));
+  const main = h("main.page");
+  ({ overview, holdings, record, plan, settings })[S.view](main, db, R, T);
+  main.append(h("footer", "Facts about your holdings, calculated from your own rules. Not financial advice."));
+  clear(root).append(top, tabs, main);
+}
+
+// ---------- overview ----------
+function overview(m, db, R, T) {
+  m.append(h("div.sum",
+    tile("Market value", money(T.value)), tile("Invested", money(T.cost)),
+    tile("Unrealized", money(T.unrealized), cls(T.unrealized), T.cost ? pct((T.unrealized / T.cost) * 100, true) : ""),
+    tile("Realized", money(T.realized), cls(T.realized))));
+  if (T.missing.length) m.append(h("p.note", `Missing exchange rate for ${T.missing.join(", ")}. Those positions are not in the totals.`));
+  if (T.estValue) m.append(h("p.note", `~ marks positions whose purchase price is unknown: ${((T.estValue / T.value) * 100).toFixed(0)}% of the portfolio. Their gains are estimates.`));
+  if (!R.length) return m.append(h("p.mu", "No open positions yet. Record a purchase to begin."));
+  const byCls = groupBy(R, "cls"), byAcct = groupBy(R, "acct");
+  const top = sortRows(R, "valEUR").slice(0, 8).map((r) => [r.sym, r.valEUR]);
+  let gl = sortRows(R.filter((r) => !r.est && Math.abs(r.gainPct) > 0.05), "gainPct").map((r) => [r.sym, r.gainPct]);
+  if (gl.length > 10) gl = [...gl.slice(0, 5), ...gl.slice(-5)];
+  m.append(h("h2", "Dashboard"), h("div.grid",
+    h("div.card", h("h3", "By asset type"), donut(byCls, T.value)),
+    h("div.card", h("h3", "By account"), bars(byAcct.map(([a, v]) => [db.accounts[a]?.name || a, v]), (v) => money(v, "EUR", 0))),
+    h("div.card", h("h3", "Largest positions"), bars(top, (v) => ((v / T.value) * 100).toFixed(1) + "%", () => "var(--c1)")),
+    h("div.card", h("h3", "Gains and losses (known cost only)"), gl.length ? bars(gl, (v) => pct(v, true), (v) => (v >= 0 ? "var(--gain)" : "var(--loss)")) : h("p.mu.sm", "None yet.")),
+    h("div.card", h("h3", "Value over time"), line(S.hist ? valueSeries(db, S.hist) : [], (v) => money(v, "EUR", 0)))));
+  if (S.prices?.updated) m.append(h("p.sm.mu", `Prices from the daily job: ${new Date(S.prices.updated).toLocaleString()}.` + (S.prices.misses?.length ? ` Not found: ${S.prices.misses.join(", ")}.` : "")));
+  else if (!S.demo) m.append(h("p.sm.mu", S.prices?.error ? `Prices could not be loaded: ${S.prices.error}` : "No daily prices yet. They appear after the price job's first run."));
+}
+function tile(label, value, c = "", sub = "") { return h("div", h("span", label), h("b" + (c ? "." + c : ""), value), sub && h("span", sub)); }
+
+// ---------- holdings ----------
+function holdings(m, db, R, T) {
+  const f = S.filters, F = facets(R);
+  const sel = (key, label, opts, fmt = (x) => x) => {
+    const el = h("select", { "aria-label": label, on: { change: () => { f[key] = el.value || undefined; renderApp(); } } },
+      h("option", { value: "" }, label), opts.map((o) => h("option", { value: o, selected: f[key] === o }, fmt(o))));
+    return el;
+  };
+  const q = h("input.search", { type: "search", placeholder: "Search name or ISIN", value: f.q || "", "aria-label": "Search" });
+  q.addEventListener("input", () => { f.q = q.value; drawList(); });
+  const sortSel = h("select", { "aria-label": "Sort", on: { change: () => { S.sort = sortSel.value; drawList(); } } },
+    [["valEUR:-1", "Value ↓"], ["gainPct:-1", "Gain % ↓"], ["gainPct:1", "Gain % ↑"], ["gainEUR:-1", "Gain € ↓"], ["weight:-1", "Weight ↓"], ["sym:1", "Name A–Z"], ["firstDate:1", "Oldest first"]]
+      .map(([v, l]) => h("option", { value: v, selected: S.sort === v }, l)));
+  m.append(h("div.filters", q,
+    sel("acct", "All accounts", F.acct, (a) => db.accounts[a]?.name || a), sel("cls", "All types", F.cls), sel("ccy", "All currencies", F.ccy),
+    sel("result", "Gain or loss", ["gain", "loss", "est"], (x) => ({ gain: "Gains only", loss: "Losses only", est: "Estimated cost (~)" })[x]), sortSel));
+  const head = h("div.listhead"), list = h("div.list");
+  m.append(head, list);
+  function drawList() {
+    const [k, d] = S.sort.split(":");
+    const shown = sortRows(filterRows(R, f), k, +d);
+    const v = shown.reduce((a, r) => a + (r.valEUR || 0), 0), g = shown.reduce((a, r) => a + (r.gainEUR || 0), 0);
+    clear(head).append(h("span", `${shown.length} of ${R.length} positions`), h("span", money(v), " · ", h("span." + (cls(g) || "mu"), money(g))));
+    clear(list).append(...(shown.length ? shown.map((r) => item(r, db)) : [h("p.mu.sm.page", "No positions match these filters.")]));
+  }
+  drawList();
+}
+
+function item(r, db) {
+  const open = S.openRows.has(r.id);
+  const el = h("div.item");
+  const btn = h("button", { "aria-expanded": String(open), on: { click: () => { open ? S.openRows.delete(r.id) : S.openRows.add(r.id); el.replaceWith(item(r, db)); } } },
+    h("div.nm", r.sym, r.est && h("span.badge.warn", { title: "Purchase price unknown" }, "~ est")),
+    h("div.v", money(r.valEUR ?? r.val, r.valEUR == null ? r.ccy : "EUR")),
+    h("div.sub", `${r.account} · ${r.cls} · ${r.weight != null ? r.weight.toFixed(1) + "%" : "–"}`),
+    h("div.g." + (cls(r.gain) || "mu"), (r.est ? "~" : "") + money(r.gain, r.ccy, 0) + " (" + pct(r.gainPct, true) + ")"));
+  el.append(btn);
+  if (open) {
+    const trades = db.trades.filter((t) => t.pid === r.id).slice(-10).reverse();
+    el.append(h("div.detail",
+      h("div.kv",
+        kv("Quantity", r.qty.toLocaleString("en-US", { maximumFractionDigits: 4 })), kv("Avg cost", money(r.avg, r.ccy)),
+        kv("Price", money(r.price, r.ccy)), kv("Price date", (r.price_date || "unknown") + (r.price_src ? ` (${r.price_src})` : "")),
+        kv("Value", money(r.val, r.ccy)), kv("Invested", money(r.cost, r.ccy)),
+        kv("ISIN", r.isin || "–"), kv("Held since", r.firstDate || "unknown")),
+      r.lots.length > 1 && h("details", h("summary.sm", `${r.lots.length} purchase lots (FIFO)`), h("div.scroll", h("table.mini",
+        h("tr", h("th", "Date"), h("th", "Qty"), h("th", "Cost")),
+        r.lots.map((l) => h("tr", h("td", (l.date || "unknown") + (l.est ? " ~" : "")), h("td", l.qty ? l.qty.toLocaleString("en-US", { maximumFractionDigits: 4 }) : "–"), h("td", money(l.cost, r.ccy))))))),
+      trades.length > 0 && h("details", h("summary.sm", "Recent transactions"), h("div.scroll", h("table.mini",
+        h("tr", h("th", "Date"), h("th", "Type"), h("th", "Qty"), h("th", "Price"), h("th", "Realized")),
+        trades.map((t) => h("tr", h("td", t.date), h("td", t.side), h("td", t.qty || "–"), h("td", money(t.price, r.ccy)), h("td." + cls(t.realized || 0), t.realized != null ? (t.est ? "~" : "") + money(t.realized, r.ccy) : "")))))),
+      h("div.row", { style: { marginTop: "8px" } },
+        r.cls === "Insurance (ULIP)" && h("button.btn", { on: { click: () => goRecord({ kind: "contribution", acct: r.acct, pid: r.id }) } }, "Add payment"),
+        h("button.btn", { on: { click: () => goRecord({ kind: "buy", acct: r.acct, pid: r.id }) } }, "Buy"),
+        h("button.btn", { on: { click: () => goRecord({ kind: "sell", acct: r.acct, pid: r.id }) } }, "Sell"),
+        h("button.btn", { on: { click: () => goRecord({ kind: "price", acct: r.acct, pid: r.id }) } }, "Set price"))));
+  }
+  return el;
+}
+const kv = (k, v) => h("div", h("span", k), v);
+function goRecord(prefill) { S.recordPrefill = prefill; S.view = "record"; renderApp(); scrollTo(0, 0); }
+
+// ---------- record ----------
+const KINDS = [["buy", "Buy"], ["sell", "Sell"], ["price", "Set price"], ["contribution", "ULIP payment"], ["import", "Import Degiro CSV"]];
+
+function record(m, db) {
+  const pre = S.recordPrefill || {}; S.recordPrefill = null;
+  let kind = pre.kind || S.lastKind || "buy";
+  const seg = h("div.seg", { role: "group", "aria-label": "Type" });
+  const body = h("div");
+  const drawSeg = () => clear(seg).append(...KINDS.map(([k, l]) =>
+    h("button", { "aria-pressed": String(kind === k), on: { click: () => { kind = k; S.lastKind = k; drawSeg(); draw(); } } }, l)));
+  const draw = () => { clear(body); kind === "import" ? importForm(body) : tradeForm(body, kind, pre); };
+  drawSeg(); draw();
+  if (S.offline) m.append(h("p.note", "You're offline. Changes can't be saved until you reconnect."));
+  m.append(seg, h("div.card", body));
+}
+
+function tradeForm(box, kind, pre) {
+  const db = S.vault.db;
+  const accts = Object.entries(db.accounts);
+  const acct = h("select", accts.map(([id, a]) => h("option", { value: id, selected: pre.acct === id }, `${a.name} (${a.ccy})`)));
+  const pos = h("select");
+  const fillPos = () => {
+    const list = db.positions.filter((p) => p.acct === acct.value && (kind === "buy" || p.qty > 0) && (kind !== "contribution" || p.cls === "Insurance (ULIP)" || p.qty > 0));
+    clear(pos).append(...list.map((p) => h("option", { value: p.id, selected: pre.pid === p.id }, p.sym)),
+      ...(kind === "buy" ? [h("option", { value: "__new" }, "New position…")] : []));
+    if (!list.length && kind !== "buy") pos.append(h("option", { value: "" }, "No positions in this account"));
+  };
+  const name = h("input", { placeholder: "e.g. Vanguard FTSE All-World" });
+  const isin = h("input", { placeholder: "optional", autocapitalize: "characters" });
+  const clsSel = h("select", ["Stock", "ETF", "Equity fund", "Debt fund", "Hybrid fund", "Gold", "Cash", "Insurance (ULIP)", "Other"].map((c) => h("option", c)));
+  const newBox = h("div.form.full", field("Name", name), field("ISIN", isin), field("Asset type", clsSel));
+  const dec = (ph) => h("input", { inputmode: "decimal", autocomplete: "off", placeholder: ph });
+  const qty = dec("0"), price = dec("0.00"), fee = dec("0.00"), amount = dec("0.00");
+  const date = h("input", { type: "date", value: today(), max: today() });
+  const preview = h("div.note.ok", { "aria-live": "polite" }, "Fill in the fields to see the result.");
+  const err = errBox();
+  const save = h("button.btn.primary", { type: "submit", disabled: S.offline }, "Save");
+
+  const ccy = () => db.accounts[acct.value]?.ccy || "EUR";
+  const symOf = () => (pos.value === "__new" ? name.value.trim() : pos.value);
+  const op = () => {
+    const base = { acct: acct.value, sym: symOf(), date: date.value || today() };
+    if (!base.sym) throw new Error("Choose a position or enter a name.");
+    if (kind === "buy" || kind === "sell") return { type: "trade", side: kind, ...base, qty: num(qty.value), price: num(price.value), fee: num(fee.value), ...(pos.value === "__new" ? { cls: clsSel.value, isin: isin.value.trim().toUpperCase() } : {}) };
+    if (kind === "price") return { type: "price", ...base, price: num(price.value) };
+    return { type: "contribution", ...base, amount: num(amount.value) };
+  };
+  const update = () => {
+    err.textContent = "";
+    newBox.hidden = pos.value !== "__new";
+    try {
+      const o = op();
+      const { db: after, result } = S.vault.preview(o);
+      const p = after.positions.find((x) => x.id === result.pid);
+      const c = ccy();
+      const lines = [`${p.sym}: ${p.qty.toLocaleString("en-US", { maximumFractionDigits: 4 })} units, invested ${money(p.cost, c)}${p.qty ? `, avg cost ${money(p.cost / p.qty, c)}` : ""}.`];
+      if (kind === "buy") lines.push(`Total paid: ${money(o.qty * o.price + (o.fee || 0), c)}.`);
+      if (kind === "sell") lines.push(`Proceeds ${money(o.qty * o.price - (o.fee || 0), c)}, cost of units sold (FIFO) ${money(result.basis, c)}, realized ${result.est ? "~" : ""}${money(result.realized, c)}.`);
+      if (kind === "price") lines.push(`New value ${money(p.qty * p.price, c)}.`);
+      clear(preview).append(...lines.map((l) => h("div", l)));
+      return o;
+    } catch (e) { clear(preview).append(e.message); return null; }
+  };
+  const fields = [];
+  fields.push(field("Account", acct), field("Position", pos), newBox);
+  if (kind === "buy" || kind === "sell") fields.push(h("div.form.full", field("Quantity", qty), field("Price per unit", price, "In the account's currency (Degiro: EUR)."), field("Fees", fee), field("Date", date)));
+  if (kind === "price") fields.push(h("div.form.full", field("Price per unit", price, "For the ULIP, enter the total fund value."), field("Price date", date)));
+  if (kind === "contribution") fields.push(h("div.form.full", field("Amount paid", amount, "Adds to the money invested; set the new fund value with 'Set price'."), field("Date", date)));
+  const form = h("form", {
+    on: {
+      input: update, change: update,
+      submit: async (e) => {
+        e.preventDefault();
+        const o = update(); if (!o) return;
+        busy(save, true, "Saving…");
+        try { await commit(o, "Saved."); S.recordPrefill = { kind, acct: o.acct }; renderApp(); }
+        catch (e2) { err.textContent = e2.message; busy(save, false, "Save"); }
+      },
+    },
+  }, fields, preview, err, save);
+  acct.addEventListener("change", () => { fillPos(); update(); });
+  fillPos();
+  if (pre.pid && kind === "price") { const p = db.positions.find((x) => x.id === pre.pid); if (p) price.value = String(p.price); }
+  newBox.hidden = pos.value !== "__new";
+  box.append(form);
+}
+
+function importForm(box) {
+  const file = h("input", { type: "file", accept: ".csv,text/csv" });
+  const out = h("div");
+  const err = errBox();
+  let pending = null;
+  const show = async (text, name) => {
+    err.textContent = ""; clear(out); pending = null;
+    try {
+      const { op, notes } = await degiroPortfolioOp(text, name, today());
+      const { db: after, result } = S.vault.preview(op);
+      if (result.skipped) return (err.textContent = result.reason);
+      const before = S.vault.db;
+      const changes = op.ops.map((o) => {
+        const a = o.isin ? after.positions.find((p) => p.acct === "degiro" && p.isin === o.isin) : findPos(after, "degiro", o.sym);
+        const b = o.isin ? before.positions.find((p) => p.acct === "degiro" && p.isin === o.isin) : findPos(before, "degiro", o.sym);
+        return h("tr", h("td", a.sym, !b && h("span.badge.warn", "new ~")), h("td", b ? b.qty.toLocaleString("en-US") : "–"), h("td", a.qty.toLocaleString("en-US")), h("td", money(a.price)));
+      });
+      pending = op;
+      out.append(h("p.sm.mu", `${name}: ${op.ops.length} rows.`, notes.length ? " " + notes.join(" · ") : ""),
+        h("div.scroll", h("table.mini", h("tr", h("th", "Position"), h("th", "Qty before"), h("th", "Qty after"), h("th", "Price €")), changes)),
+        h("p.sm.mu", "Quantity changes without a recorded trade are added as estimated lots (~). Record real buys and sells to keep gains exact."),
+        h("button.btn.primary", { disabled: S.offline, on: { click: async (e) => {
+          busy(e.target, true, "Saving…");
+          try { await commit(pending, "Degiro prices updated."); renderApp(); } catch (e2) { err.textContent = e2.message; busy(e.target, false, "Apply import"); }
+        } } }, "Apply import"));
+    } catch (e) { err.textContent = e.message; }
+  };
+  file.addEventListener("change", async () => { const f = file.files[0]; if (f) show(await f.text(), f.name); });
+  box.append(field("Degiro Portfolio.csv", file, "Degiro → Portfolio → Export → CSV. The file is read on this device and archived inside your encrypted vault."));
+  if (folder.supported()) {
+    const btnPick = h("button.btn", { type: "button" }, "Choose imports folder");
+    const btnLatest = h("button.btn", { type: "button" }, "Import newest from folder");
+    const info = h("span.sm.mu");
+    folder.name().then((n) => { info.textContent = n ? `Folder: ${n}` : "No folder chosen yet."; btnLatest.disabled = !n; });
+    btnPick.addEventListener("click", async () => { try { const n = await folder.pick(); info.textContent = `Folder: ${n}`; btnLatest.disabled = false; } catch (e) { if (e.name !== "AbortError") err.textContent = e.message; } });
+    btnLatest.addEventListener("click", async () => { try { const f = await folder.newest(/portfolio.*\.csv$/i); if (!f) return (err.textContent = "No Portfolio*.csv in that folder."); show(await f.text(), f.name); } catch (e) { err.textContent = e.message; } });
+    box.append(h("div.row", btnPick, btnLatest, info));
+  }
+  box.append(err, out);
+}
+
+// ---------- plan ----------
+function plan(m, db, R, T) {
+  const C = checks(db, R, T);
+  m.append(h("h2", "Checks"), C.length
+    ? h("div.list", C.map((c) => h("div.item", h("div.detail", { style: { paddingTop: "10px" } }, h("div", h("b", c.title), c.level === "warn" && h("span.badge.warn", "attention")), h("div.mu", c.detail)))))
+    : h("p.note.ok", "Nothing to flag under your current rules."));
+
+  const A = allocation(db, R, T);
+  const inputs = {};
+  m.append(h("h2", "Allocation vs. your targets"),
+    h("p.sm.mu", `Rebalancing band: ${db.rules.bandAbs} points absolute or ${db.rules.bandRel}% of the target, whichever is smaller (the 5/25 rule).`),
+    h("div.card.scroll", h("table.mini",
+      h("tr", h("th", "Asset type"), h("th", "Value"), h("th", "Now"), h("th", "Target %"), h("th", "Difference")),
+      A.map((a) => {
+        inputs[a.cls] = h("input", { inputmode: "decimal", value: a.target ?? "", style: { width: "72px", minHeight: "32px", padding: "4px 6px" }, "aria-label": `Target for ${a.cls}` });
+        return h("tr", h("td", a.cls), h("td", money(a.value, "EUR", 0)), h("td", a.pct.toFixed(1) + "%"), h("td", inputs[a.cls]),
+          h("td." + (a.outside ? "loss" : "mu"), a.diffPct == null ? "–" : `${a.diffPct > 0 ? "+" : ""}${a.diffPct.toFixed(1)} pts (${money(a.diffEUR, "EUR", 0)})${a.outside ? " outside band" : ""}`));
+      }))),
+    h("div.row", { style: { marginTop: "8px" } }, h("button.btn", { on: { click: async () => {
+      const targets = {};
+      for (const [k, el] of Object.entries(inputs)) if (el.value.trim()) targets[k] = num(el.value);
+      const sum = Object.values(targets).reduce((a, b) => a + b, 0);
+      if (Object.keys(targets).length && Math.abs(sum - 100) > 0.5) return toast(`Targets add up to ${sum.toFixed(1)}%, not 100%.`);
+      try { await commit({ type: "rules", patch: { targets } }, "Targets saved."); renderApp(); } catch (e) { toast(e.message); }
+    } } }, "Save targets")));
+
+  const amt = h("input", { inputmode: "decimal", placeholder: "e.g. 2000" });
+  const res = h("div");
+  amt.addEventListener("input", () => {
+    clear(res);
+    const x = num(amt.value || "0");
+    if (!x) return;
+    const split = splitNewMoney(A, T.value, x);
+    res.append(split.length ? h("table.mini", split.map((s2) => h("tr", h("td", s2.cls), h("td", money(s2.amount, "EUR", 0)))))
+      : h("p.sm.mu", "Set targets above first."));
+  });
+  m.append(h("h2", "New money"), h("div.card", field("Amount to invest (EUR)", amt, "Splits the amount across asset types below target, so the mix moves toward your targets. It doesn't pick products."), res));
+
+  const rf = (k, label, hint) => { const el = h("input", { inputmode: "decimal", value: db.rules[k] }); el.dataset.k = k; return field(label, el, hint); };
+  const rulesForm = h("form.form", {
+    on: { submit: async (e) => {
+      e.preventDefault();
+      const patch = {};
+      for (const el of rulesForm.querySelectorAll("input[data-k]")) patch[el.dataset.k] = num(el.value);
+      try { await commit({ type: "rules", patch }, "Rules saved."); renderApp(); } catch (e2) { toast(e2.message); }
+    } },
+  }, rf("maxWeight", "Single-stock limit (%)"), rf("takeProfitPct", "Review gains above (%)"), rf("bandAbs", "Band, absolute (pts)"), rf("bandRel", "Band, relative (%)"), rf("staleDays", "Price is stale after (days)"),
+    h("div.full", h("button.btn", { type: "submit" }, "Save rules")));
+  m.append(h("h2", "Your rules"), h("div.card", rulesForm),
+    h("p.sm.mu", "Coming next: tax estimates for a sale (Germany and India), take-money-out planner, XIRR and time-weighted return."));
+}
+
+// ---------- settings ----------
+function settings(m, db) {
+  const d = S.device || {};
+  let theme = "auto"; try { theme = localStorage.getItem("pt.theme") || "auto"; } catch {}
+  const themeSel = h("select", { on: { change: () => { try { localStorage.setItem("pt.theme", themeSel.value); } catch {} applyTheme(); } } },
+    [["auto", "Match system"], ["light", "Light"], ["dark", "Dark"]].map(([v, l]) => h("option", { value: v, selected: theme === v }, l)));
+  m.append(h("h2", "This device"), h("div.card",
+    h("div.kv", kv("Vault", S.demo ? "Demo (in memory)" : `${d.owner}/${d.repo}`), kv("Positions", String(db.positions.filter((p) => p.qty > 0).length)), kv("Transactions", String(db.trades.length)), kv("Imports", String(db.imports.length)), kv("App version", document.querySelector('meta[name="app-version"]')?.content || "dev")),
+    field("Appearance", themeSel),
+    h("div.row", h("button.btn", { on: { click: () => lock("Locked.") } }, "Lock now"),
+      !S.demo && h("button.btn", { on: { click: exportBackup } }, "Download encrypted backup"))));
+
+  if (S.demo) return;
+  const oldP = h("input", { type: "password", autocomplete: "current-password" });
+  const newP = h("input", { type: "password", autocomplete: "new-password" });
+  const err = errBox();
+  const go = h("button.btn", { type: "submit" }, "Change passphrase");
+  m.append(h("h2", "Passphrase"), h("div.card", h("form", {
+    on: { submit: async (e) => {
+      e.preventDefault(); err.textContent = ""; busy(go, true, "Working…");
+      try {
+        const f = await S.store.read(VAULT_PATH);
+        const r = await changePassphrase(JSON.parse(f.text), oldP.value, newP.value);
+        await S.store.write(VAULT_PATH, JSON.stringify(r.file), f.sha, "update");
+        S.session = r.session; S.vault.session = r.session; await S.vault.load(); await cacheVault();
+        toast("Passphrase changed. Other devices need the new one next time."); renderApp();
+      } catch (e2) { err.textContent = e2.message; busy(go, false, "Change passphrase"); }
+    } },
+  }, field("Current passphrase", oldP), field("New passphrase", newP, "Your recovery key keeps working."), err, go)));
+  m.append(h("h2", "Remove"), h("div.card", h("p.sm.mu", "Removes the saved connection and encrypted copy from this browser. The vault on GitHub is not touched."),
+    h("button.btn.danger", { on: { click: () => { if (confirm("Forget this device?")) { writeDevice(null); lock(); } } } }, "Forget this device")));
+}
+
+async function exportBackup() {
+  const file = await encryptData(S.session, S.vault.db);
+  const a = h("a", { href: URL.createObjectURL(new Blob([JSON.stringify(file)], { type: "application/octet-stream" })), download: `portfolio-${today()}.enc` });
+  document.body.append(a); a.click(); a.remove();
+}
+
+addEventListener("hashchange", () => { if (location.hash === "#demo" && !S.session) boot(); });
+boot();

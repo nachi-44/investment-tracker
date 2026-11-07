@@ -1,0 +1,22 @@
+name: CI
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Unit tests (same suite as web/tests.html)
+        run: node scripts/test.mjs
+      - name: Price job parsers
+        run: node scripts/fetch-prices.mjs --selftest
+      - name: No private data in this public repo
+        run: |
+          bad=$(git ls-files | grep -Ei '(^|/)seed\.json$|\.enc$|\.pdf$|(^|/)data/|portfolio\.json$' || true)
+          if [ -n "$bad" ]; then echo "Private files tracked: $bad"; exit 1; fi
