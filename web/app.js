@@ -1,5 +1,5 @@
 // App shell: connect / unlock, views, auto-lock. All data handling goes through core.js, vault.js and sync.js.
-import { h, clear, cls, toast, donut, bars, avatar, icon, logo, heroArea, classColor } from "./ui.js";
+import { h, clear, cls, toast, donut, bars, avatar, icon, logo, heroChart, classColor } from "./ui.js";
 import { migrate, rows, totals, groupBy, facets, filterRows, sortRows, money, pct, num, today, findPos } from "./core.js";
 import { createVault, unlock, recover, changePassphrase, encryptData, decryptData, sealSecret, openSecret, passphraseProblem } from "./vault.js";
 import { GitHubStore, MemoryStore, Vault, VAULT_PATH, AuthError } from "./sync.js";
@@ -245,7 +245,7 @@ async function refreshPrices() {
       S.vault.db = r.db;
       S.prices = { updated: r.updated, applied: r.applied, misses: r.misses, lastQuote: r.lastQuote, sha: latest.sha };
     }
-    if (hist) S.hist = parseHistory(hist.text);
+    if (hist) { S.hist = parseHistory(hist.text); S.histStamp = hist.sha; }
     return latest?.sha || null;
   } catch (e) { S.prices = { ...(S.prices || {}), error: e.message }; return null; }
 }
@@ -318,7 +318,7 @@ async function startDemo() {
 /** Made-up price history for the demo (a gentle random walk ending at today's sample prices). */
 function demoHistory(db) {
   const hist = new Map(), days = [];
-  for (let d = new Date(Date.now() - 864e5); days.length < 90; d = new Date(d - 864e5)) if (d.getDay() % 6) days.unshift(d.toISOString().slice(0, 10));
+  for (let d = new Date(Date.now() - 864e5); days.length < 400; d = new Date(d - 864e5)) if (d.getDay() % 6) days.unshift(d.toISOString().slice(0, 10));
   let seed = 7; const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647) - 0.5;
   for (const p of db.positions) {
     if (!p.isin) continue;
@@ -385,20 +385,40 @@ function drawStatus() {
 // ---------- overview ----------
 function overview(m, db, R, T) {
   // ----- hero: total, today's change, all-time gain, value chart -----
-  const series = S.hist ? valueSeries(db, S.hist) : [];
+  const series = seriesFor(db);
   const DC = dayChanges(db, S.hist);
   const dayChg = DC.size ? [...DC.values()].reduce((a, c) => a + c.eur, 0) : null;
   const prevTotal = dayChg != null ? T.value - dayChg : 0;
   const gainPct = T.cost ? (T.unrealized / T.cost) * 100 : 0;
-  const [whole, cents] = money(T.value).split(".");
   const pill = (v, text) => h("span.pill" + (v > 0 ? ".up" : v < 0 ? ".down" : ""), text);
-  m.append(h("section.hero",
-    h("div.lbl", "Total value"),
-    h("div.big", whole, cents && h("span.cents", "." + cents)),
-    h("div.pills",
-      dayChg != null && pill(dayChg, `${signed(dayChg)} (${pct(prevTotal ? (dayChg / prevTotal) * 100 : 0, true)}) today`),
-      pill(T.unrealized, `${signed(T.unrealized)} (${pct(gainPct, true)}) all time`)),
-    series.length >= 2 ? h("div.chart", heroArea([...series.filter(([d]) => d < today()), [today(), T.value]])) : h("div.empty", "Your value chart builds up from today, one point per trading day.")));
+  const lbl = h("div.lbl", "Total value"), big = h("div.big");
+  const setBig = (v) => { const [whole, cents] = money(v).split("."); clear(big).append(whole, cents && h("span.cents", "." + cents)); };
+  setBig(T.value);
+  const rangeChg = h("span.rchg");
+  const hero = h("section.hero", lbl, big, h("div.pills",
+    dayChg != null && pill(dayChg, `${signed(dayChg)} (${pct(prevTotal ? (dayChg / prevTotal) * 100 : 0, true)}) today`),
+    rangeChg));
+  m.append(hero);
+
+  // value chart with ranges (1W … All) and tap/drag to inspect a date
+  const full = [...series.filter(([d]) => d < today()), [today(), T.value]];
+  if (full.length >= 3) {
+    const chartBox = h("div.chart"), axis = h("div.axis");
+    const chips = h("div.ranges", { role: "group", "aria-label": "Chart range" });
+    const draw = () => {
+      const pts = inRange(full, S.range);
+      const first = pts[0][1], last = pts.at(-1)[1], d = last - first;
+      clear(rangeChg).append(pill(d, `${signed(d)} (${pct(first ? (d / first) * 100 : 0, true)}) ${S.range === "All" ? "all" : S.range}`));
+      clear(chips).append(...RANGES.map(([k]) => h("button", { "aria-pressed": String(S.range === k), on: { click: () => { S.range = k; try { localStorage.setItem("pt.range", k); } catch {} draw(); } } }, k)));
+      clear(chartBox).append(heroChart(pts, (i) => {
+        if (i == null) { lbl.textContent = "Total value"; setBig(T.value); return; }
+        lbl.textContent = fmtDate(pts[i][0]); setBig(pts[i][1]);
+      }));
+      clear(axis).append(h("span", fmtDate(pts[0][0])), h("span", fmtDate(pts.at(-1)[0])));
+    };
+    hero.append(h("div.rangebar", chips), chartBox, axis);
+    draw();
+  } else hero.append(h("div.empty", S.demo ? "" : "Loading your price history. The chart appears after the next price refresh (about a minute)."));
 
   m.append(h("div.kpis",
     kpi("Invested", money(T.cost, "EUR", 0)),
@@ -437,6 +457,25 @@ function overview(m, db, R, T) {
   else if (!S.demo) m.append(h("p.sm.mu", S.prices?.error ? `Prices could not be loaded: ${S.prices.error}` : "No prices yet. Tap ↻ to fetch them (takes about a minute)."));
   if (S.pricesError) m.append(h("p.note", S.pricesError));
 }
+const RANGES = [["1W", 7], ["1M", 30], ["3M", 91], ["YTD", null], ["1Y", 365], ["All", Infinity]];
+try { S.range = localStorage.getItem("pt.range") || "1Y"; } catch { S.range = "1Y"; }
+function inRange(pts, key) {
+  const days = RANGES.find(([k]) => k === key)?.[1];
+  const from = days === null ? new Date().getFullYear() + "-01-01"
+    : days === Infinity ? "0000" : new Date(Date.now() - days * 864e5).toISOString().slice(0, 10);
+  const out = pts.filter(([d]) => d >= from);
+  return out.length >= 2 ? out : pts.slice(-2);
+}
+const fmtDate = (d) => new Date(d + "T12:00:00").toLocaleDateString([], { day: "numeric", month: "short", year: "numeric" });
+/** Value series is costly with years of history: compute once per data/history change. */
+let seriesCache = { key: null, val: [] };
+function seriesFor(db) {
+  if (!S.hist) return [];
+  const key = `${db.updated}|${S.hist.size}|${S.histStamp || ""}|${db.positions.length}`;
+  if (seriesCache.key !== key) seriesCache = { key, val: valueSeries(db, S.hist) };
+  return seriesCache.val;
+}
+
 function kpi(label, value, extra) { return h("div.kpi", h("span", label), h("b", value), extra); }
 const signed = (v, ccy = "EUR") => (v > 0 ? "+" : "") + money(v, ccy, Math.abs(v) < 10 ? 2 : 0);
 function compact(v) {

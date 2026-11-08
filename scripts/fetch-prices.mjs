@@ -59,7 +59,7 @@ export function parseAMFI(txt) {
     const nav = parseFloat(p[navCol]);
     if (!Number.isFinite(nav)) continue;
     const date = amfiDate(p[dateCol].trim());
-    for (const isin of [p[1].trim(), p[2].trim()]) if (/^[A-Z]{2}[A-Z0-9]{10}$/.test(isin)) out.set(isin, { nav, date });
+    for (const isin of [p[1].trim(), p[2].trim()]) if (/^[A-Z]{2}[A-Z0-9]{10}$/.test(isin)) out.set(isin, { nav, date, code: p[0].trim() });
   }
   return out;
 }
@@ -96,6 +96,24 @@ export function parseYahooChart(j) {
   return { price, ccy, date: t.slice(0, 10), time: t };
 }
 
+/** Yahoo chart JSON with a long range -> [[date, close]] (pence converted), skipping empty days. */
+export function parseYahooHistory(j) {
+  const r = j?.chart?.result?.[0];
+  const ts = r?.timestamp || [], close = r?.indicators?.quote?.[0]?.close || [];
+  const div = r?.meta?.currency === "GBp" || r?.meta?.currency === "GBX" || r?.meta?.currency === "ZAc" ? 100 : 1;
+  const out = [];
+  for (let i = 0; i < ts.length; i++) if (Number.isFinite(close[i]) && close[i] > 0) out.push([new Date(ts[i] * 1000).toISOString().slice(0, 10), close[i] / div]);
+  return out;
+}
+
+/** mfapi.in scheme history -> [[date, nav]] (its dates are dd-mm-yyyy). */
+export function parseMfapi(j) {
+  return (j?.data || []).map((x) => {
+    const [d, m, y] = String(x.date).split("-");
+    return [`${y}-${m}-${d}`, parseFloat(x.nav)];
+  }).filter(([d, v]) => /^\d{4}-\d{2}-\d{2}$/.test(d) && v > 0);
+}
+
 /** Stooq symbol from a Yahoo symbol (SAP.DE -> sap.de, AAPL -> aapl.us). */
 export function stooqSymbol(y) {
   const s = y.toLowerCase();
@@ -122,6 +140,21 @@ async function run(dir) {
   const prev = existsSync(prevPath) ? JSON.parse(await readFile(prevPath, "utf8")) : { fx: {}, quotes: {} };
   const out = { updated: new Date().toISOString(), fx: { ...prev.fx }, quotes: { ...prev.quotes }, misses: [] };
   const log = (...a) => console.log(...a);
+  // One-time history backfill (about 5 years of daily closes) for every instrument that doesn't have it yet.
+  const bfPath = join(outDir, "backfill.json");
+  const backfilled = existsSync(bfPath) ? JSON.parse(await readFile(bfPath, "utf8")) : {};
+  const extra = []; // [date, key, price, ccy]
+  const backfill = async (key, fn) => {
+    if (backfilled[key]) return;
+    try {
+      const rows = await fn();
+      if (rows.length) { extra.push(...rows); backfilled[key] = { rows: rows.length, from: rows[0][0], at: out.updated.slice(0, 10) }; }
+      log(`  history ${key}: ${rows.length} days` + (rows.length ? ` from ${rows[0][0]}` : ""));
+    } catch (e) { log(`  history ${key}: ${e.message}`); }
+    await sleep(300);
+  };
+  const yahooHistory = async (sym, key, ccy) => parseYahooHistory(await get(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?range=5y&interval=1d`, { json: true }))
+    .map(([d, v]) => [d, key, v, ccy]);
 
   // FX: ECB reference rates (official, once a day), then live Yahoo rates on top where available.
   try {
@@ -136,6 +169,9 @@ async function run(dir) {
     } catch (e) { log(`  live FX ${c}: ${e.message} (keeping ECB)`); }
   }
   if (!Object.keys(out.fx).length && (wl.fx || []).length) out.misses.push("FX");
+  for (const c of wl.fx || []) {
+    await backfill("FX:" + c, async () => (await yahooHistory(`EUR${c}=X`, "FX:" + c, "EUR")).map(([d, k, v]) => [d, k, 1 / v, "EUR"]));
+  }
   log("FX: " + (wl.fx || []).map((c) => `${c}=${out.fx[c]?.rate?.toFixed(6) ?? "?"} (${out.fx[c]?.src ?? "-"})`).join(" "));
 
   // Mutual funds (AMFI)
@@ -153,6 +189,10 @@ async function run(dir) {
       const n = navs?.get(f.isin);
       if (n) out.quotes[f.isin] = { price: n.nav, ccy: "INR", date: n.date, src: "amfi" };
       else out.misses.push(f.isin);
+      if (n?.code) await backfill(f.isin, async () => {
+        const cutoff = new Date(Date.now() - 5 * 365.25 * 864e5).toISOString().slice(0, 10);
+        return parseMfapi(await get(`https://api.mfapi.in/mf/${n.code}`, { json: true })).filter(([d]) => d >= cutoff).map(([d, v]) => [d, f.isin, v, "INR"]);
+      });
     }
     log(`AMFI: ${funds.length - funds.filter((f) => out.misses.includes(f.isin)).length}/${funds.length} funds priced`);
   }
@@ -182,7 +222,7 @@ async function run(dir) {
       let q = null;
       try { q = parseYahooChart(await get(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?range=5d&interval=1d`, { json: true })); }
       catch (e) { log(`  yahoo ${sym}: ${e.message}`); }
-      if (q) out.quotes[key] = { ...q, src: "yahoo", symbol: sym };
+      if (q) { out.quotes[key] = { ...q, src: "yahoo", symbol: sym }; await backfill(key, () => yahooHistory(sym, key, q.ccy)); }
       else {
         const s = parseStooq(await get(`https://stooq.com/q/l/?s=${encodeURIComponent(stooqSymbol(sym))}&f=sd2t2ohlcv&h&e=csv`));
         if (!s) throw new Error("no quote from Yahoo or Stooq");
@@ -200,16 +240,19 @@ async function run(dir) {
   // so the last run of a day leaves the closing price. Public data, used for the value chart.
   const histPath = join(outDir, "history.csv");
   const old = existsSync(histPath) ? await readFile(histPath, "utf8") : "";
-  await writeFile(histPath, mergeHistory(old, out));
+  await writeFile(histPath, mergeHistory(old, out, extra));
+  await writeFile(bfPath, JSON.stringify(backfilled, null, 1) + "\n");
   if (total && out.misses.length === total) process.exitCode = 1;
 }
 
-export function mergeHistory(csv, latest) {
+/** Merge history: existing lines, then backfilled rows (never overwriting a line we already have), then today's quotes. */
+export function mergeHistory(csv, latest, extra = []) {
   const m = new Map();
   for (const line of csv.split(/\r?\n/).slice(1)) {
     const p = line.split(",");
     if (p.length >= 4 && p[0]) m.set(`${p[0]},${p[1]}`, line);
   }
+  for (const [d, k, v, c] of extra) if (!m.has(`${d},${k}`)) m.set(`${d},${k}`, `${d},${k},${+v.toPrecision(10)},${c}`);
   for (const [c, v] of Object.entries(latest.fx || {})) if (v.date) m.set(`${v.date},FX:${c}`, `${v.date},FX:${c},${v.rate},EUR`);
   for (const [k, v] of Object.entries(latest.quotes || {})) if (v.date) m.set(`${v.date},${k}`, `${v.date},${k},${v.price},${v.ccy}`);
   return "date,key,price,ccy\n" + [...m.values()].sort().join("\n") + "\n";
@@ -223,6 +266,13 @@ function selftest() {
   assert(a.get("INF209KA12Z1")?.nav === 123.4567 && a.get("INF209KA12Z1").date === "2026-11-06" && !a.has("INF000000009"), "AMFI");
   const a2 = parseAMFI("Scheme Code;ISIN Div Payout/ ISIN Growth;ISIN Div Reinvestment;Scheme Name;Plan;Option;Net Asset Value;Date\r\n \r\nAxis Mutual Fund\r\n100528;INF090I01DG6;-;Franklin India Corporate Bond Fund;Regular Plan;Growth;107.0500;06-Nov-2026\n127039;INF247L01411;-;Motilal Oswal Midcap Fund;;;102.8412;06-Nov-2026");
   assert(a2.get("INF090I01DG6")?.nav === 107.05 && a2.get("INF247L01411")?.nav === 102.8412 && a2.get("INF090I01DG6").date === "2026-11-06", "AMFI with Plan/Option columns");
+  assert(a2.get("INF090I01DG6").code === "100528", "AMFI scheme code");
+  const yh = parseYahooHistory({ chart: { result: [{ meta: { currency: "GBp" }, timestamp: [1794000000, 1794086400, 1794172800], indicators: { quote: [{ close: [7550, null, 7600] }] } }] } });
+  assert(yh.length === 2 && yh[0][1] === 75.5 && /^\d{4}-\d{2}-\d{2}$/.test(yh[0][0]), "yahoo history");
+  const mf = parseMfapi({ data: [{ date: "06-11-2026", nav: "107.05000" }, { date: "05-11-2026", nav: "106.9" }] });
+  assert(mf[0][0] === "2026-11-06" && mf[0][1] === 107.05 && mf.length === 2, "mfapi");
+  const h2 = mergeHistory("date,key,price,ccy\n2026-11-06,X,2,EUR\n", { fx: {}, quotes: {} }, [["2026-11-06", "X", 9, "EUR"], ["2026-11-05", "X", 1.5, "EUR"]]);
+  assert(h2 === "date,key,price,ccy\n2026-11-05,X,1.5,EUR\n2026-11-06,X,2,EUR\n", "backfill does not overwrite: " + h2);
   assert(figiToYahoo([{ ticker: "4GLD", exchCode: "GY" }, { ticker: "4GLD", exchCode: "GF" }]) === "4GLD.DE", "openfigi xetra");
   assert(pickSymbol([{ symbol: "IWDA.L", quoteType: "ETF" }, { symbol: "EUNL.DE", quoteType: "ETF" }]) === "EUNL.DE", "prefer Xetra");
   assert(pickSymbol([{ symbol: "KTKBANK.BO" }, { symbol: "KTKBANK.NS" }], true) === "KTKBANK.NS", "prefer NSE");

@@ -106,9 +106,42 @@ export function donut(items, total, { center, sub, colorOf = (n, i) => color(i) 
   return h("div.dn", h("div.ring", svg, center && h("div.center", h("b", center), sub && h("span", sub))), legend);
 }
 
+/**
+ * Interactive hero chart: area + line, a marker that follows the pointer/finger, and onHover(index|null).
+ * points: [[date, value]]
+ */
+export function heroChart(points, onHover) {
+  const W = 600, H = 120;
+  const svg = heroArea(points, W, H);
+  const xs = points.map((_, i) => (i / (points.length - 1)) * W);
+  const ys = points.map((p) => p[1]);
+  const y0 = Math.min(...ys), y1 = Math.max(...ys), pad = (y1 - y0) * 0.15 || 1;
+  const Y = (y) => H - 8 - ((y - (y0 - pad)) / (y1 - y0 + 2 * pad)) * (H - 16);
+  const vline = s("line", { y1: 0, y2: H, stroke: "rgba(255,255,255,.55)", "stroke-width": 1, "vector-effect": "non-scaling-stroke", "stroke-dasharray": "3 3", visibility: "hidden" });
+  const dot = s("circle", { r: 5, fill: "#fff", stroke: "rgba(0,0,0,.25)", "stroke-width": 2, "vector-effect": "non-scaling-stroke", visibility: "hidden" });
+  svg.append(vline, dot);
+  const pick = (clientX) => {
+    const r = svg.getBoundingClientRect();
+    const x = ((clientX - r.left) / r.width) * W;
+    let i = Math.round((x / W) * (points.length - 1));
+    i = Math.max(0, Math.min(points.length - 1, i));
+    vline.setAttribute("x1", xs[i]); vline.setAttribute("x2", xs[i]);
+    dot.setAttribute("cx", xs[i]); dot.setAttribute("cy", Y(ys[i]));
+    vline.setAttribute("visibility", "visible"); dot.setAttribute("visibility", "visible");
+    onHover?.(i);
+  };
+  const leave = () => { vline.setAttribute("visibility", "hidden"); dot.setAttribute("visibility", "hidden"); onHover?.(null); };
+  svg.addEventListener("pointermove", (e) => pick(e.clientX));
+  svg.addEventListener("pointerdown", (e) => { pick(e.clientX); svg.setPointerCapture?.(e.pointerId); });
+  svg.addEventListener("pointerup", leave);
+  svg.addEventListener("pointerleave", leave);
+  svg.addEventListener("pointercancel", leave);
+  svg.style.touchAction = "pan-y";
+  return svg;
+}
+
 /** Area chart for the hero card (white on gradient). points: [[date, value]] */
-export function heroArea(points) {
-  const W = 600, H = 110;
+export function heroArea(points, W = 600, H = 110) {
   const ys = points.map((p) => p[1]);
   const y0 = Math.min(...ys), y1 = Math.max(...ys), pad = (y1 - y0) * 0.15 || 1;
   const X = (i) => (i / (points.length - 1)) * W, Y = (y) => H - 8 - ((y - (y0 - pad)) / (y1 - y0 + 2 * pad)) * (H - 16);
@@ -126,7 +159,7 @@ export function heroArea(points) {
     s("defs", {}, s("linearGradient", { id, x1: 0, y1: 0, x2: 0, y2: 1 },
       s("stop", { offset: "0", "stop-color": "#fff", "stop-opacity": ".35" }), s("stop", { offset: "1", "stop-color": "#fff", "stop-opacity": "0" }))),
     s("path", { d: `${d}L${W},${H}L0,${H}Z`, fill: `url(#${id})` }),
-    s("path", { d, fill: "none", stroke: "#fff", "stroke-width": 2.5, "vector-effect": "non-scaling-stroke", "stroke-linecap": "round" }),
+    s("path", { d, fill: "none", stroke: "#fff", "stroke-width": 2, "vector-effect": "non-scaling-stroke", "stroke-linecap": "round", "stroke-linejoin": "round" }),
     s("circle", { cx: last[0] - 4, cy: last[1], r: 4, fill: "#fff" }));
 }
 

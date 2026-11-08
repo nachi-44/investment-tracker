@@ -93,8 +93,13 @@ main.page>*{animation:rise .35s ease both}
 .hero .pills{display:flex;gap:8px;flex-wrap:wrap}
 .hero .pill{background:rgba(255,255,255,.16);color:#fff;border:1px solid rgba(255,255,255,.18);backdrop-filter:blur(6px)}
 .hero .pill.up::before{content:"▲ ";font-size:.8em}.hero .pill.down::before{content:"▼ ";font-size:.8em}
-.hero .chart{margin:14px -22px 0;height:110px}
+.hero .chart{margin:8px -22px 0;height:130px;cursor:crosshair}
 .hero .chart svg{width:100%;height:100%;display:block}
+.rangebar{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-top:16px}
+.ranges{display:flex;gap:2px;background:rgba(0,0,0,.18);border-radius:12px;padding:3px}
+.ranges button{border:0;background:none;color:rgba(255,255,255,.75);font-size:12.5px;font-weight:600;padding:5px 10px;border-radius:9px;cursor:pointer}
+.ranges button[aria-pressed="true"]{background:rgba(255,255,255,.95);color:#312E81}
+.axis{display:flex;justify-content:space-between;font-size:11px;opacity:.7;padding:6px 0 12px}
 .hero .empty{padding:18px 0 22px;font-size:13px;opacity:.75}
 
 /* ---------- pills, badges ---------- */
@@ -112,7 +117,11 @@ main.page>*{animation:rise .35s ease both}
   .kpi{scroll-snap-align:start;padding:11px 13px}
   .kpi b{font-size:17px}
   .hero{padding:18px 18px 0;border-radius:24px}
-  .hero .chart{margin:10px -18px 0;height:80px}
+  .hero .chart{margin:8px -18px 0;height:110px}
+  .ranges{flex:1;justify-content:space-between}
+  .ranges button{padding:5px 8px;flex:1}
+  .hero .pill{font-size:11.5px;padding:3px 8px}
+  .hero .pills{flex-wrap:nowrap;overflow:hidden}
 }
 .kpi{background:var(--s);border-radius:var(--r);padding:14px 16px;box-shadow:var(--shadow);min-width:0}
 .kpi>span:first-child{display:block;color:var(--mu);font-size:12px;font-weight:500}
