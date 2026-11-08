@@ -1,5 +1,5 @@
 import { test, assert } from "./harness.js";
-import { watchlist, mergePrices, parseHistory, valueSeries } from "../prices.js";
+import { watchlist, mergePrices, parseHistory, valueSeries, dayChanges } from "../prices.js";
 import { migrate, applyOp } from "../core.js";
 import { splitNewMoney, allocation, checks } from "../rules.js";
 import { rows, totals } from "../core.js";
@@ -49,6 +49,16 @@ test("value series uses history and adds back later sales", () => {
   assert.near(s[0][1], 1000 + 50 + 100 + 10);
   // 11-06: 5 units * 110
   assert.near(s[1][1], 550 + 50 + 100 + 10);
+});
+
+test("day change compares with the previous close, converted to the account currency", () => {
+  let db = db0();
+  db = mergePrices(db, { fx: { USD: { rate: 0.9, date: "2026-11-06" } }, quotes: { US0000000001: { price: 110, ccy: "USD", date: "2026-11-06", src: "yahoo" } } }).db;
+  // current: 110 USD = 99 EUR; previous close (11-05): 100 USD at 0.9 = 90 EUR -> +10%
+  const hist = parseHistory("date,key,price,ccy\n2026-11-05,US0000000001,100,USD\n2026-11-06,US0000000001,110,USD\n2026-11-05,FX:USD,0.9,EUR\n");
+  const dc = dayChanges(db, hist).get(db.positions[0].id);
+  assert.near(dc.pct, 10, 1e-9);
+  assert.near(dc.eur, 10 * 9);
 });
 
 test("new money goes to classes below target", () => {

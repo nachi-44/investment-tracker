@@ -1,12 +1,12 @@
 // App shell: connect / unlock, views, auto-lock. All data handling goes through core.js, vault.js and sync.js.
-import { h, clear, cls, toast, donut, bars, line } from "./ui.js";
+import { h, clear, cls, toast, donut, bars, avatar, icon, logo, heroArea, classColor } from "./ui.js";
 import { migrate, rows, totals, groupBy, facets, filterRows, sortRows, money, pct, num, today, findPos } from "./core.js";
 import { createVault, unlock, recover, changePassphrase, encryptData, decryptData, sealSecret, openSecret, passphraseProblem } from "./vault.js";
 import { GitHubStore, MemoryStore, Vault, VAULT_PATH, AuthError } from "./sync.js";
 import { degiroPortfolioOp, sha256 } from "./importers/degiro.js";
 import { checks, allocation, splitNewMoney } from "./rules.js";
 import * as folder from "./folder.js";
-import { watchlist, mergePrices, parseHistory, valueSeries } from "./prices.js";
+import { watchlist, mergePrices, parseHistory, valueSeries, dayChanges } from "./prices.js";
 
 const DEVICE_KEY = "pt.device.v1";
 const IDLE_MS = 5 * 60 * 1000;
@@ -30,7 +30,7 @@ async function cacheVault() {
 
 // ---------- theme ----------
 function applyTheme() {
-  let t = "auto"; try { t = localStorage.getItem("pt.theme") || "auto"; } catch {}
+  let t = "dark"; try { t = localStorage.getItem("pt.theme") || "dark"; } catch {}
   if (t === "auto") document.documentElement.removeAttribute("data-theme"); else document.documentElement.dataset.theme = t;
 }
 applyTheme();
@@ -56,7 +56,7 @@ function boot(msg) {
   return renderLock(msg);
 }
 
-function screen(...kids) { clear(root).append(h("div.center", ...kids)); }
+function screen(...kids) { clear(root).append(h("div.center", logo("logo"), ...kids)); }
 function field(lbl, input, hint) {
   if (!input.id) input.id = "f" + Math.random().toString(36).slice(2, 8);
   return h("div.field", h("label", { for: input.id }, lbl), input, hint && h("div.sm.mu", hint));
@@ -311,8 +311,26 @@ async function startDemo() {
   const { file, session } = await createVault("demo demo demo demo demo", seed, { iterations: 1000 });
   const store = new MemoryStore({ [VAULT_PATH]: { text: JSON.stringify(file), sha: "m0" } });
   const v = new Vault(store, session); await v.load();
-  Object.assign(S, { store, session, vault: v, offline: false, savedAt: null });
+  Object.assign(S, { store, session, vault: v, offline: false, savedAt: null, hist: demoHistory(v.db) });
   renderApp();
+}
+
+/** Made-up price history for the demo (a gentle random walk ending at today's sample prices). */
+function demoHistory(db) {
+  const hist = new Map(), days = [];
+  for (let d = new Date(Date.now() - 864e5); days.length < 90; d = new Date(d - 864e5)) if (d.getDay() % 6) days.unshift(d.toISOString().slice(0, 10));
+  let seed = 7; const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647) - 0.5;
+  for (const p of db.positions) {
+    if (!p.isin) continue;
+    const ccy = db.accounts[p.acct].ccy, series = [];
+    let price = p.price / (1.004 + rnd() * 0.012); // yesterday's close, so "today" shows a change
+    for (let i = days.length - 1; i >= 0; i--) { series.unshift([days[i], price, ccy]); price = price / (1 + 0.0012 + rnd() * 0.022); }
+    series.push([today(), p.price, ccy]);
+    p.price_date = today();
+    hist.set(p.isin, series);
+  }
+  hist.set("FX:INR", days.map((d) => [d, db.rates.INR, "EUR"]));
+  return hist;
 }
 
 // ---------- commit helper ----------
@@ -334,12 +352,12 @@ function renderApp() {
   const db = S.vault.db;
   const R = rows(db), T = totals(db, R);
   const top = h("header.top", h("div.page",
-    h("h1", "Portfolio"), h("div.status#status"), h("button.btn.icon#refresh", {
+    h("div.brand", logo(), h("h1", "Portfolio")), h("div.status#status"), h("button.btn.icon#refresh", {
       title: "Refresh prices now", "aria-label": "Refresh prices now", hidden: S.demo || S.offline,
       on: { click: () => livePrices({ force: true }) },
-    }, "↻")));
+    }, icon("refresh"))));
   const tabs = h("nav.tabs", { role: "tablist" }, VIEWS.map(([id, label]) =>
-    h("button", { role: "tab", "aria-selected": String(S.view === id), on: { click: () => { S.view = id; renderApp(); scrollTo(0, 0); } } }, label)));
+    h("button", { role: "tab", "aria-selected": String(S.view === id), on: { click: () => { S.view = id; renderApp(); scrollTo(0, 0); } } }, icon(id), h("span", label))));
   const main = h("main.page");
   ({ overview, holdings, record, plan, settings })[S.view](main, db, R, T);
   main.append(h("footer", "Facts about your holdings, calculated from your own rules. Not financial advice."));
@@ -358,35 +376,73 @@ function drawStatus() {
     : S.prices?.updated ? `Prices ${dayTime(S.prices.lastQuote || S.prices.updated)}`
     : "No prices fetched yet";
   el.className = "status" + (S.offline || S.pricesError ? " err" : "");
-  clear(el).append(h("div", money(T.value)), h("div", line2));
+  const dot = !S.demo && !S.offline && h("i.live" + (S.pricesBusy ? ".busy" : ""), { "aria-hidden": "true" });
+  clear(el).append(h("b", money(T.value)), h("div.line2", dot, line2));
   const btn = document.getElementById("refresh");
   if (btn) { btn.disabled = !!S.pricesBusy; btn.classList.toggle("spin", !!S.pricesBusy); }
 }
 
 // ---------- overview ----------
 function overview(m, db, R, T) {
-  m.append(h("div.sum",
-    tile("Market value", money(T.value)), tile("Invested", money(T.cost)),
-    tile("Unrealized", money(T.unrealized), cls(T.unrealized), T.cost ? pct((T.unrealized / T.cost) * 100, true) : ""),
-    tile("Realized", money(T.realized), cls(T.realized))));
-  if (T.missing.length) m.append(h("p.note", `Missing exchange rate for ${T.missing.join(", ")}. Those positions are not in the totals.`));
-  if (T.estValue) m.append(h("p.note", `~ marks positions whose purchase price is unknown: ${((T.estValue / T.value) * 100).toFixed(0)}% of the portfolio. Their gains are estimates.`));
-  if (!R.length) return m.append(h("p.mu", "No open positions yet. Record a purchase to begin."));
+  // ----- hero: total, today's change, all-time gain, value chart -----
+  const series = S.hist ? valueSeries(db, S.hist) : [];
+  const DC = dayChanges(db, S.hist);
+  const dayChg = DC.size ? [...DC.values()].reduce((a, c) => a + c.eur, 0) : null;
+  const prevTotal = dayChg != null ? T.value - dayChg : 0;
+  const gainPct = T.cost ? (T.unrealized / T.cost) * 100 : 0;
+  const [whole, cents] = money(T.value).split(".");
+  const pill = (v, text) => h("span.pill" + (v > 0 ? ".up" : v < 0 ? ".down" : ""), text);
+  m.append(h("section.hero",
+    h("div.lbl", "Total value"),
+    h("div.big", whole, cents && h("span.cents", "." + cents)),
+    h("div.pills",
+      dayChg != null && pill(dayChg, `${signed(dayChg)} (${pct(prevTotal ? (dayChg / prevTotal) * 100 : 0, true)}) today`),
+      pill(T.unrealized, `${signed(T.unrealized)} (${pct(gainPct, true)}) all time`)),
+    series.length >= 2 ? h("div.chart", heroArea([...series.filter(([d]) => d < today()), [today(), T.value]])) : h("div.empty", "Your value chart builds up from today, one point per trading day.")));
+
+  m.append(h("div.kpis",
+    kpi("Invested", money(T.cost, "EUR", 0)),
+    kpi("Unrealized", money(T.unrealized, "EUR", 0), h("span.pill." + (cls(T.unrealized) || "neutral"), pct(gainPct, true))),
+    kpi("Realized", money(T.realized, "EUR", 0)),
+    kpi("Holdings", String(R.length), h("span.pill.neutral", `${Object.keys(db.accounts).length} accounts`))));
+
+  if (T.missing.length) m.append(h("p.note", `Missing exchange rate for ${T.missing.join(", ")}. Those positions are not in the totals yet.`));
+  if (!R.length) return m.append(h("div.card", h("p.mu", "No holdings yet. Go to Record → Import file to add them.")));
+
+  // ----- top holdings with today's move -----
+  const topRows = sortRows(R, "valEUR").slice(0, 8);
+  const moveOf = (r) => DC.get(r.id);
+  m.append(h("div.sect", h("h2", "Top holdings"), h("button.link", { on: { click: () => { S.view = "holdings"; renderApp(); scrollTo(0, 0); } } }, `All ${R.length} →`)),
+    h("div.tops", topRows.map((r) => {
+      const mv = moveOf(r);
+      return h("button.top-row", { on: { click: () => { S.openRows.add(r.id); S.view = "holdings"; renderApp(); } } },
+        avatar(r.sym, r.cls),
+        h("div.nm", h("b", r.sym), h("span", `${r.cls} · ${r.weight?.toFixed(1) ?? "–"}%`)),
+        h("div.val", h("b", money(r.valEUR ?? r.val, r.valEUR == null ? r.ccy : "EUR", 0)),
+          mv ? h("span." + (cls(mv.pct) || "mu"), `${mv.pct > 0 ? "▲" : mv.pct < 0 ? "▼" : ""} ${pct(Math.abs(mv.pct))} · ${signed(mv.eur)}`)
+            : h("span.mu", r.cls === "Cash" ? "cash" : r.cls === "Insurance (ULIP)" ? "value set by you" : "no change yet")));
+    })));
+  if (T.estValue) m.append(h("p.note", `~ marks holdings whose purchase price is unknown (${((T.estValue / T.value) * 100).toFixed(0)}% of the portfolio). Their gains are estimates. Fix them via Holdings → Set real cost.`));
+
   const byCls = groupBy(R, "cls"), byAcct = groupBy(R, "acct");
-  const top = sortRows(R, "valEUR").slice(0, 8).map((r) => [r.sym, r.valEUR]);
-  let gl = sortRows(R.filter((r) => !r.est && Math.abs(r.gainPct) > 0.05), "gainPct").map((r) => [r.sym, r.gainPct]);
-  if (gl.length > 10) gl = [...gl.slice(0, 5), ...gl.slice(-5)];
-  m.append(h("h2", "Dashboard"), h("div.grid",
-    h("div.card", h("h3", "By asset type"), donut(byCls, T.value)),
-    h("div.card", h("h3", "By account"), bars(byAcct.map(([a, v]) => [db.accounts[a]?.name || a, v]), (v) => money(v, "EUR", 0))),
-    h("div.card", h("h3", "Largest positions"), bars(top, (v) => ((v / T.value) * 100).toFixed(1) + "%", () => "var(--c1)")),
-    h("div.card", h("h3", "Gains and losses (known cost only)"), gl.length ? bars(gl, (v) => pct(v, true), (v) => (v >= 0 ? "var(--gain)" : "var(--loss)")) : h("p.mu.sm", "None yet.")),
-    h("div.card", h("h3", "Value over time"), line(S.hist ? valueSeries(db, S.hist) : [], (v) => money(v, "EUR", 0)))));
+  const known = sortRows(R.filter((r) => !r.est && Math.abs(r.gainPct) > 0.05), "gainPct");
+  const movers = known.length > 6 ? [...known.slice(0, 3), ...known.slice(-3)] : known;
+  m.append(h("div.grid", { style: { marginTop: "14px" } },
+    h("div.card", h("h3", "Allocation"), donut(byCls, T.value, { center: compact(T.value), sub: `${byCls.length} types`, colorOf: (n, i) => classColor(n, i) })),
+    h("div.card", h("h3", "Best and worst (known cost)"), movers.length
+      ? h("div.movers", movers.map((r) => h("div.mover", avatar(r.sym, r.cls), h("div.nm", r.sym), h("span.pill." + (cls(r.gain) || "neutral"), pct(r.gainPct, true)))))
+      : h("p.mu.sm", "Appears once holdings have real purchase costs.")),
+    h("div.card", h("h3", "By account"), bars(byAcct.map(([a, v]) => [db.accounts[a]?.name || a, v]), (v) => compact(v)))));
   if (S.prices?.updated) m.append(h("p.sm.mu", `Stocks, ETFs and exchange rates: latest quotes, as of ${dayTime(S.prices.lastQuote || S.prices.updated)} (free sources can be up to 15 minutes delayed). Mutual funds and the ULIP have one price per day.` + (S.prices.misses?.length ? ` Not found: ${S.prices.misses.join(", ")}.` : "")));
   else if (!S.demo) m.append(h("p.sm.mu", S.prices?.error ? `Prices could not be loaded: ${S.prices.error}` : "No prices yet. Tap ↻ to fetch them (takes about a minute)."));
   if (S.pricesError) m.append(h("p.note", S.pricesError));
 }
-function tile(label, value, c = "", sub = "") { return h("div", h("span", label), h("b" + (c ? "." + c : ""), value), sub && h("span", sub)); }
+function kpi(label, value, extra) { return h("div.kpi", h("span", label), h("b", value), extra); }
+const signed = (v, ccy = "EUR") => (v > 0 ? "+" : "") + money(v, ccy, Math.abs(v) < 10 ? 2 : 0);
+function compact(v) {
+  const a = Math.abs(v);
+  return a >= 1e6 ? "€" + (v / 1e6).toFixed(2) + "M" : a >= 1e4 ? "€" + (v / 1e3).toFixed(1) + "k" : money(v, "EUR", 0);
+}
 
 // ---------- holdings ----------
 function holdings(m, db, R, T) {
@@ -420,10 +476,11 @@ function item(r, db) {
   const open = S.openRows.has(r.id);
   const el = h("div.item");
   const btn = h("button", { "aria-expanded": String(open), on: { click: () => { open ? S.openRows.delete(r.id) : S.openRows.add(r.id); el.replaceWith(item(r, db)); } } },
+    avatar(r.sym, r.cls),
     h("div.nm", r.sym, r.est && h("span.badge.warn", { title: "Purchase price unknown" }, "~ est")),
     h("div.v", money(r.valEUR ?? r.val, r.valEUR == null ? r.ccy : "EUR")),
     h("div.sub", `${r.account} · ${r.cls} · ${r.weight != null ? r.weight.toFixed(1) + "%" : "–"}`),
-    h("div.g." + (cls(r.gain) || "mu"), (r.est ? "~" : "") + money(r.gain, r.ccy, 0) + " (" + pct(r.gainPct, true) + ")"));
+    h("div.g", h("span.pill." + (cls(r.gain) || "neutral"), (r.est ? "~" : "") + pct(r.gainPct, true))));
   el.append(btn);
   if (open) {
     const trades = db.trades.filter((t) => t.pid === r.id).slice(-10).reverse();
@@ -597,8 +654,7 @@ function importForm(box) {
         } } }, "Add holdings"));
     } catch (e) { err.textContent = e instanceof SyntaxError ? "This file isn't valid JSON." : e.message; }
   });
-  box.append(field("seed.json: all accounts at once (Degiro, India, ULIP)", seedFile, "Read on this device and saved encrypted. Holdings already in your vault are skipped."),
-    h("hr", { style: { border: 0, borderTop: "1px solid var(--ln)", margin: "16px 0" } }));
+  box.append(field("seed.json: all accounts at once (Degiro, India, ULIP)", seedFile, "Read on this device and saved encrypted. Holdings already in your vault are skipped."), h("hr"));
 
   box.append(field("Degiro Portfolio.csv", file, "Degiro → Portfolio → Export → CSV. The file is read on this device and archived inside your encrypted vault."));
   if (folder.supported()) {
@@ -668,9 +724,9 @@ function plan(m, db, R, T) {
 // ---------- settings ----------
 function settings(m, db) {
   const d = S.device || {};
-  let theme = "auto"; try { theme = localStorage.getItem("pt.theme") || "auto"; } catch {}
+  let theme = "dark"; try { theme = localStorage.getItem("pt.theme") || "dark"; } catch {}
   const themeSel = h("select", { on: { change: () => { try { localStorage.setItem("pt.theme", themeSel.value); } catch {} applyTheme(); } } },
-    [["auto", "Match system"], ["light", "Light"], ["dark", "Dark"]].map(([v, l]) => h("option", { value: v, selected: theme === v }, l)));
+    [["dark", "Dark"], ["light", "Light"], ["auto", "Match system"]].map(([v, l]) => h("option", { value: v, selected: theme === v }, l)));
   m.append(h("h2", "This device"), h("div.card",
     h("div.kv", kv("Vault", S.demo ? "Demo (in memory)" : `${d.owner}/${d.repo}`), kv("Positions", String(db.positions.filter((p) => p.qty > 0).length)), kv("Transactions", String(db.trades.length)), kv("Imports", String(db.imports.length)), kv("App version", document.querySelector('meta[name="app-version"]')?.content || "dev")),
     field("Appearance", themeSel),

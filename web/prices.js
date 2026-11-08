@@ -67,6 +67,31 @@ const at = (series, d) => { // last value on or before d
 };
 
 /**
+ * Change since the previous close, per position: compares the current price with the last history price
+ * before the current price's date (so on a weekend it shows Friday's move).
+ * Returns Map(pid -> {pct, eur}) for positions with market data.
+ */
+export function dayChanges(db, hist) {
+  const out = new Map();
+  if (!hist) return out;
+  for (const p of db.positions) {
+    if (!(p.qty > 0)) continue;
+    const series = hist.get(p.isin || p.ticker);
+    if (!series) continue;
+    const ref = p.price_date || series.at(-1)?.[0];
+    const prev = [...series].reverse().find(([d]) => d < ref);
+    if (!prev) continue;
+    const acctCcy = db.accounts[p.acct]?.ccy;
+    const fx = (c, d) => (c === "EUR" ? 1 : at(hist.get("FX:" + c), d)?.[1] ?? rate(db, c));
+    const prevAcct = (prev[1] * (fx(prev[2], prev[0]) ?? 0)) / (fx(acctCcy, prev[0]) || 1);
+    if (!(prevAcct > 0)) continue;
+    const diff = p.price - prevAcct;
+    out.set(p.id, { pct: (diff / prevAcct) * 100, eur: p.qty * diff * (rate(db, acctCcy) ?? 0) });
+  }
+  return out;
+}
+
+/**
  * Portfolio value in EUR per history date. Quantity on a day = today's quantity minus later buys plus later sells.
  * Positions without market data (ULIP, cash) count at their current value; lots with unknown dates count as held throughout.
  */
