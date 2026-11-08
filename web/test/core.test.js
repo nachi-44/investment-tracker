@@ -152,6 +152,30 @@ test("an empty portfolio has no rows and zero totals", () => {
   assert.eq(d2.positions.length, 1);
 });
 
+test("seed import adds all accounts at once and skips duplicates", () => {
+  const empty = migrate({ rates: {}, accounts: { degiro: { name: "Degiro", ccy: "EUR" } }, positions: [] });
+  const data = {
+    rates: { INR: 0.0105 },
+    accounts: { degiro: { name: "Degiro", ccy: "EUR" }, india: { name: "India", ccy: "INR" }, ulip: { name: "ULIP", ccy: "INR" } },
+    positions: [
+      { acct: "degiro", sym: "ETF A", isin: "ie00x", cls: "ETF", qty: 5, cost: 500, price: 110 },
+      { acct: "india", sym: "Fund B", isin: "INF1", cls: "Equity fund", qty: 10, cost: 1000, price: 120, est: true },
+      { acct: "ulip", sym: "ULIP", cls: "Insurance (ULIP)", qty: 1, cost: 450000, price: 470000 },
+    ],
+  };
+  const r = applyOp(empty, { type: "seed", data });
+  assert.deep(r.result.added, ["ETF A", "Fund B", "ULIP"]);
+  const db = r.db;
+  assert.eq(Object.keys(db.accounts).length, 3);
+  assert.eq(db.rates.INR, 0.0105);
+  assert.eq(db.positions[0].isin, "IE00X");
+  assert.ok(db.positions[1].est);
+  assert.near(totals(db).value, 550 + 1200 * 0.0105 + 470000 * 0.0105);
+  const again = applyOp(db, { type: "seed", data });
+  assert.eq(again.result.added.length, 0); assert.eq(again.result.skipped.length, 3);
+  assert.throws(() => applyOp(empty, { type: "seed", data: { accounts: {}, positions: [{ acct: "x", sym: "y" }] } }), /unknown account/);
+});
+
 test("import op is skipped when the same file hash was imported before", () => {
   const op = { type: "import", file: { name: "a.csv", hash: "abc" }, ops: [{ type: "price", acct: "degiro", sym: "Stock A", price: 1 }] };
   const { db } = applyOp(base(), op);

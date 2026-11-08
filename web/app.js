@@ -3,7 +3,7 @@ import { h, clear, cls, toast, donut, bars, line } from "./ui.js";
 import { migrate, rows, totals, groupBy, facets, filterRows, sortRows, money, pct, num, today, findPos } from "./core.js";
 import { createVault, unlock, recover, changePassphrase, encryptData, decryptData, sealSecret, openSecret, passphraseProblem } from "./vault.js";
 import { GitHubStore, MemoryStore, Vault, VAULT_PATH, AuthError } from "./sync.js";
-import { degiroPortfolioOp } from "./importers/degiro.js";
+import { degiroPortfolioOp, sha256 } from "./importers/degiro.js";
 import { checks, allocation, splitNewMoney } from "./rules.js";
 import * as folder from "./folder.js";
 import { watchlist, mergePrices, parseHistory, valueSeries } from "./prices.js";
@@ -452,7 +452,7 @@ const kv = (k, v) => h("div", h("span", k), v);
 function goRecord(prefill) { S.recordPrefill = prefill; S.view = "record"; renderApp(); scrollTo(0, 0); }
 
 // ---------- record ----------
-const KINDS = [["buy", "Buy"], ["sell", "Sell"], ["price", "Set price"], ["cost", "Set cost"], ["contribution", "ULIP payment"], ["import", "Import Degiro CSV"]];
+const KINDS = [["buy", "Buy"], ["sell", "Sell"], ["price", "Set price"], ["cost", "Set cost"], ["contribution", "ULIP payment"], ["import", "Import file"]];
 
 function record(m, db) {
   const pre = S.recordPrefill || {}; S.recordPrefill = null;
@@ -572,6 +572,34 @@ function importForm(box) {
     } catch (e) { err.textContent = e.message; }
   };
   file.addEventListener("change", async () => { const f = file.files[0]; if (f) show(await f.text(), f.name); });
+
+  // seed.json: a whole starting portfolio (all accounts) in one step
+  const seedFile = h("input", { type: "file", accept: ".json,application/json" });
+  seedFile.addEventListener("change", async () => {
+    const f = seedFile.files[0]; if (!f) return;
+    err.textContent = ""; clear(out); pending = null;
+    try {
+      const text = await f.text();
+      const op = { type: "import", file: { name: f.name, hash: await sha256(text), date: today(), kind: "seed" }, ops: [{ type: "seed", data: JSON.parse(text) }] };
+      const { db: after, result } = S.vault.preview(op);
+      if (result.skipped) return (err.textContent = result.reason);
+      const { added, skipped } = result.results[0];
+      const R2 = rows(after).filter((r) => added.includes(r.sym));
+      pending = op;
+      out.append(
+        h("p.sm.mu", `${f.name}: ${added.length} holdings to add` + (skipped.length ? `, ${skipped.length} already in your vault and skipped (${skipped.join(", ")})` : "") + "."),
+        h("div.scroll", h("table.mini", h("tr", h("th", "Holding"), h("th", "Account"), h("th", "Type"), h("th", "Qty"), h("th", "Value")),
+          R2.map((r) => h("tr", h("td", r.sym, r.est && h("span.badge.warn", "~")), h("td", r.account), h("td", r.cls), h("td", r.qty.toLocaleString("en-US", { maximumFractionDigits: 4 })), h("td", money(r.val, r.ccy, 0)))))),
+        h("button.btn.primary", { disabled: S.offline || !added.length, on: { click: async (e) => {
+          busy(e.target, true, "Saving…");
+          try { await commit(pending, `${added.length} holdings added.`); S.view = "holdings"; renderApp(); }
+          catch (e2) { err.textContent = e2.message; busy(e.target, false, "Add holdings"); }
+        } } }, "Add holdings"));
+    } catch (e) { err.textContent = e instanceof SyntaxError ? "This file isn't valid JSON." : e.message; }
+  });
+  box.append(field("seed.json: all accounts at once (Degiro, India, ULIP)", seedFile, "Read on this device and saved encrypted. Holdings already in your vault are skipped."),
+    h("hr", { style: { border: 0, borderTop: "1px solid var(--ln)", margin: "16px 0" } }));
+
   box.append(field("Degiro Portfolio.csv", file, "Degiro → Portfolio → Export → CSV. The file is read on this device and archived inside your encrypted vault."));
   if (folder.supported()) {
     const btnPick = h("button.btn", { type: "button" }, "Choose imports folder");

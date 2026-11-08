@@ -127,6 +127,7 @@ function applyInPlace(db, op) {
     case "contribution": return contribution(db, op);
     case "price": return setPrice(db, op);
     case "cost": return setCost(db, op);
+    case "seed": return seedImport(db, op);
     case "position": return patchPosition(db, op);
     case "rules": db.rules = { ...db.rules, ...op.patch }; return {};
     case "import": {
@@ -214,6 +215,36 @@ function setPrice(db, op) {
   p.price_date = op.date || today();
   p.price_src = op.src || "manual";
   return { pid: p.id };
+}
+
+/**
+ * Add a whole starting portfolio (seed.json format, as in the prototype) to an existing vault.
+ * Adds missing accounts and rates; positions already present (same account and ISIN, or same name) are skipped.
+ */
+function seedImport(db, op) {
+  const src = op.data || {};
+  if (!src.accounts || !Array.isArray(src.positions)) throw new Error("This file needs 'accounts' and 'positions'.");
+  for (const [id, a] of Object.entries(src.accounts)) if (!db.accounts[id]) db.accounts[id] = { name: a.name || id, ccy: a.ccy || "EUR" };
+  for (const [c, r] of Object.entries(src.rates || {})) if (db.rates[c] == null && r > 0) db.rates[c] = r;
+  const added = [], skipped = [];
+  for (const x of src.positions) {
+    if (!x.acct || !x.sym || !db.accounts[x.acct]) throw new Error(`Position "${x.sym || "?"}" has an unknown account "${x.acct}".`);
+    const qty = +x.qty || 0, cost = +x.cost || 0, price = +x.price || 0;
+    if (qty < 0 || cost < 0 || price < 0 || !Number.isFinite(qty + cost + price)) throw new Error(`Position "${x.sym}" has an invalid number.`);
+    const dup = db.positions.find((p) => p.acct === x.acct && ((x.isin && p.isin === x.isin) || p.sym.toLowerCase() === String(x.sym).toLowerCase()));
+    if (dup) { skipped.push(x.sym); continue; }
+    const p = {
+      id: newId(), acct: x.acct, sym: String(x.sym).trim(), isin: (x.isin || "").trim().toUpperCase(), cls: x.cls || "Stock",
+      qty, cost, price, price_date: x.price_date || null, price_src: "seed",
+      lots: qty > EPS || cost > EPS ? [{ date: x.date || null, qty, cost, est: !!x.est }] : [],
+    };
+    if (x.ticker) p.ticker = x.ticker;
+    if (x.realized) p.realized = +x.realized;
+    syncPosition(p);
+    db.positions.push(p);
+    added.push(p.sym);
+  }
+  return { added, skipped };
 }
 
 /**
