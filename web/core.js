@@ -126,6 +126,7 @@ function applyInPlace(db, op) {
     case "trade": return op.side === "sell" ? sell(db, op) : buy(db, op);
     case "contribution": return contribution(db, op);
     case "price": return setPrice(db, op);
+    case "cost": return setCost(db, op);
     case "position": return patchPosition(db, op);
     case "rules": db.rules = { ...db.rules, ...op.patch }; return {};
     case "import": {
@@ -212,6 +213,20 @@ function setPrice(db, op) {
   p.price = positive(+op.price, "Price");
   p.price_date = op.date || today();
   p.price_src = op.src || "manual";
+  return { pid: p.id };
+}
+
+/**
+ * Replace a position's cost basis with the real total paid (e.g. from Degiro or a CAS statement).
+ * All lots are merged into one known lot, which clears the "estimated" (~) flag.
+ */
+function setCost(db, op) {
+  const p = findPos(db, op.acct, op.sym);
+  if (!p) throw new Error("Position not found: " + op.sym);
+  if (!(p.qty > 0)) throw new Error("This position has no units.");
+  const cost = positive(+op.cost, "Total invested");
+  p.lots = [{ date: op.date || null, qty: p.qty, cost }];
+  syncPosition(p);
   return { pid: p.id };
 }
 

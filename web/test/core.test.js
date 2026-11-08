@@ -136,6 +136,22 @@ test("sync-qty: added units become an estimated lot, cash follows value", () => 
   assert.eq(c.qty, 250); assert.eq(c.cost, 250);
 });
 
+test("set cost replaces an estimated cost with the real one", () => {
+  const { db } = applyOp(base(), { type: "cost", acct: "india", sym: "Fund B", cost: 8000, date: "2024-03-01" });
+  const p = db.positions[1];
+  assert.eq(p.cost, 8000); assert.eq(p.qty, 100); assert.ok(!p.est);
+  assert.eq(p.lots[0].date, "2024-03-01");
+  assert.throws(() => applyOp(base(), { type: "cost", acct: "india", sym: "Fund B", cost: 0 }), /Total invested/);
+});
+
+test("an empty portfolio has no rows and zero totals", () => {
+  const db = migrate({ rates: {}, accounts: { degiro: { name: "Degiro", ccy: "EUR" } }, positions: [] });
+  const t = totals(db);
+  assert.eq(t.value, 0); assert.eq(rows(db).length, 0);
+  const { db: d2 } = applyOp(db, { type: "trade", side: "buy", acct: "degiro", sym: "First", qty: 1, price: 10, isin: "IE00X" });
+  assert.eq(d2.positions.length, 1);
+});
+
 test("import op is skipped when the same file hash was imported before", () => {
   const op = { type: "import", file: { name: "a.csv", hash: "abc" }, ops: [{ type: "price", acct: "degiro", sym: "Stock A", price: 1 }] };
   const { db } = applyOp(base(), op);

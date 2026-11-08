@@ -116,10 +116,9 @@ function renderCreate(store, conn) {
         const problem = passphraseProblem(p1.value);
         if (problem) return (err.textContent = problem);
         if (p1.value !== p2.value) return (err.textContent = "The passphrases don't match.");
-        if (!file.files[0]) return (err.textContent = "Choose your seed.json file.");
         busy(go, true, "Encrypting…");
         try {
-          const data = migrate(JSON.parse(await file.files[0].text()));
+          const data = migrate(file.files[0] ? JSON.parse(await file.files[0].text()) : emptyPortfolio());
           if (!Object.keys(data.accounts).length || !Array.isArray(data.positions)) throw new Error("seed.json needs accounts and positions.");
           const { file: vf, session, recovery } = await createVault(p1.value, data);
           const sha = await store.write(VAULT_PATH, JSON.stringify(vf), null, "create vault");
@@ -129,10 +128,18 @@ function renderCreate(store, conn) {
       },
     },
   },
-    field("Your seed.json (stays on this device; only the encrypted result is uploaded)", file),
+    field("Starting data (optional)", file, "Leave empty to start with your three accounts (Degiro, India, SBI Life ULIP) and add holdings afterwards: import the Degiro CSV, record buys. If you have a seed.json, choose it here; it stays on this device and only the encrypted result is uploaded."),
     field("New passphrase", p1, "At least 5 random words, or 16+ varied characters."),
     field("Repeat passphrase", p2), err, go);
   screen(h("h1", "Create your vault"), h("p.mu", "No vault exists in this repository yet."), h("div.card", form), privacyNote());
+}
+
+function emptyPortfolio() {
+  return {
+    rates: {},
+    accounts: { degiro: { name: "Degiro", ccy: "EUR" }, india: { name: "India", ccy: "INR" }, ulip: { name: "SBI Life ULIP", ccy: "INR" } },
+    positions: [],
+  };
 }
 
 function renderRecovery(code, next) {
@@ -225,8 +232,8 @@ async function openVault(store, session, sha) {
   await refreshPrices();
   await cacheVault();
   renderApp();
-  syncWatchlist().catch(() => {});
-  livePrices();
+  // The watchlist must be saved before the price job starts, or the job fetches the old list.
+  syncWatchlist().catch(() => {}).finally(() => livePrices());
 }
 
 /** Read the price job's output (public market data) and apply it in memory. Returns the file's sha. */
@@ -251,7 +258,8 @@ const LIVE_TIMEOUT = 150 * 1000;
  * Automatic on unlock and when the app comes back to the foreground, if prices are older than 15 minutes.
  */
 async function livePrices({ force = false } = {}) {
-  if (S.demo || S.offline || !S.store?.dispatch || S.pricesBusy) return;
+  if (S.demo || S.offline || !S.store?.dispatch) return;
+  if (S.pricesBusy) { if (force) S.pricesAgain = true; return; }
   const age = S.prices?.updated ? Date.now() - Date.parse(S.prices.updated) : Infinity;
   if (!force && age < LIVE_MAX_AGE) return;
   S.pricesBusy = true; S.pricesError = null; drawStatus();
@@ -273,6 +281,7 @@ async function livePrices({ force = false } = {}) {
   finally {
     S.pricesBusy = false;
     if (S.vault) S.view === "record" ? drawStatus() : renderApp();
+    if (S.pricesAgain && S.vault) { S.pricesAgain = false; livePrices({ force: true }); }
   }
 }
 const timeOf = (iso) => (iso ? new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "–");
@@ -288,11 +297,12 @@ document.addEventListener("visibilitychange", () => {
 
 /** Keep watchlist.json (identifiers only) in step with the positions, so the price job knows what to fetch. */
 async function syncWatchlist() {
-  if (S.demo || S.offline) return;
+  if (S.demo || S.offline) return false;
   const want = JSON.stringify(watchlist(S.vault.db), null, 1) + "\n";
   const cur = await S.store.read("watchlist.json");
-  if (cur?.text === want) return;
+  if (cur?.text === want) return false;
   await S.store.write("watchlist.json", want, cur?.sha || null, "update");
+  return true;
 }
 
 async function startDemo() {
@@ -311,7 +321,8 @@ async function commit(op, okMsg) {
   const res = await S.vault.commit(op);
   S.savedAt = new Date();
   await cacheVault();
-  syncWatchlist().catch(() => {});
+  // A new holding changes the watchlist: fetch its price right away.
+  syncWatchlist().then((changed) => changed && livePrices({ force: true })).catch(() => {});
   if (okMsg) toast(okMsg);
   return res;
 }
@@ -432,7 +443,8 @@ function item(r, db) {
         r.cls === "Insurance (ULIP)" && h("button.btn", { on: { click: () => goRecord({ kind: "contribution", acct: r.acct, pid: r.id }) } }, "Add payment"),
         h("button.btn", { on: { click: () => goRecord({ kind: "buy", acct: r.acct, pid: r.id }) } }, "Buy"),
         h("button.btn", { on: { click: () => goRecord({ kind: "sell", acct: r.acct, pid: r.id }) } }, "Sell"),
-        h("button.btn", { on: { click: () => goRecord({ kind: "price", acct: r.acct, pid: r.id }) } }, "Set price"))));
+        h("button.btn", { on: { click: () => goRecord({ kind: "price", acct: r.acct, pid: r.id }) } }, "Set price"),
+        h("button.btn", { on: { click: () => goRecord({ kind: "cost", acct: r.acct, pid: r.id }) } }, r.est ? "Set real cost" : "Set cost"))));
   }
   return el;
 }
@@ -440,7 +452,7 @@ const kv = (k, v) => h("div", h("span", k), v);
 function goRecord(prefill) { S.recordPrefill = prefill; S.view = "record"; renderApp(); scrollTo(0, 0); }
 
 // ---------- record ----------
-const KINDS = [["buy", "Buy"], ["sell", "Sell"], ["price", "Set price"], ["contribution", "ULIP payment"], ["import", "Import Degiro CSV"]];
+const KINDS = [["buy", "Buy"], ["sell", "Sell"], ["price", "Set price"], ["cost", "Set cost"], ["contribution", "ULIP payment"], ["import", "Import Degiro CSV"]];
 
 function record(m, db) {
   const pre = S.recordPrefill || {}; S.recordPrefill = null;
@@ -467,12 +479,13 @@ function tradeForm(box, kind, pre) {
     if (!list.length && kind !== "buy") pos.append(h("option", { value: "" }, "No positions in this account"));
   };
   const name = h("input", { placeholder: "e.g. Vanguard FTSE All-World" });
-  const isin = h("input", { placeholder: "optional", autocapitalize: "characters" });
+  const isin = h("input", { placeholder: "e.g. INF209K01YN0", autocapitalize: "characters" });
   const clsSel = h("select", ["Stock", "ETF", "Equity fund", "Debt fund", "Hybrid fund", "Gold", "Cash", "Insurance (ULIP)", "Other"].map((c) => h("option", c)));
-  const newBox = h("div.form.full", field("Name", name), field("ISIN", isin), field("Asset type", clsSel));
+  const newBox = h("div.form.full", field("Name", name), field("ISIN", isin, "Needed for automatic prices. Not needed for the ULIP or cash."), field("Asset type", clsSel));
   const dec = (ph) => h("input", { inputmode: "decimal", autocomplete: "off", placeholder: ph });
   const qty = dec("0"), price = dec("0.00"), fee = dec("0.00"), amount = dec("0.00");
   const date = h("input", { type: "date", value: today(), max: today() });
+  const costDate = h("input", { type: "date", max: today() });
   const preview = h("div.note.ok", { "aria-live": "polite" }, "Fill in the fields to see the result.");
   const err = errBox();
   const save = h("button.btn.primary", { type: "submit", disabled: S.offline }, "Save");
@@ -484,6 +497,7 @@ function tradeForm(box, kind, pre) {
     if (!base.sym) throw new Error("Choose a position or enter a name.");
     if (kind === "buy" || kind === "sell") return { type: "trade", side: kind, ...base, qty: num(qty.value), price: num(price.value), fee: num(fee.value), ...(pos.value === "__new" ? { cls: clsSel.value, isin: isin.value.trim().toUpperCase() } : {}) };
     if (kind === "price") return { type: "price", ...base, price: num(price.value) };
+    if (kind === "cost") return { type: "cost", acct: base.acct, sym: base.sym, cost: num(amount.value), date: costDate.value || null };
     return { type: "contribution", ...base, amount: num(amount.value) };
   };
   const update = () => {
@@ -498,6 +512,7 @@ function tradeForm(box, kind, pre) {
       if (kind === "buy") lines.push(`Total paid: ${money(o.qty * o.price + (o.fee || 0), c)}.`);
       if (kind === "sell") lines.push(`Proceeds ${money(o.qty * o.price - (o.fee || 0), c)}, cost of units sold (FIFO) ${money(result.basis, c)}, realized ${result.est ? "~" : ""}${money(result.realized, c)}.`);
       if (kind === "price") lines.push(`New value ${money(p.qty * p.price, c)}.`);
+      if (kind === "cost") { const g = p.qty * p.price - p.cost; lines.push(`Gain at the current price: ${money(g, c)} (${pct(p.cost ? (g / p.cost) * 100 : 0, true)}). No longer marked as estimated.`); }
       clear(preview).append(...lines.map((l) => h("div", l)));
       return o;
     } catch (e) { clear(preview).append(e.message); return null; }
@@ -506,6 +521,9 @@ function tradeForm(box, kind, pre) {
   fields.push(field("Account", acct), field("Position", pos), newBox);
   if (kind === "buy" || kind === "sell") fields.push(h("div.form.full", field("Quantity", qty), field("Price per unit", price, "In the account's currency (Degiro: EUR)."), field("Fees", fee), field("Date", date)));
   if (kind === "price") fields.push(h("div.form.full", field("Price per unit", price, "For the ULIP, enter the total fund value."), field("Price date", date)));
+  if (kind === "cost") fields.push(h("div.form.full",
+    field("Total invested", amount, "What you paid in total for the units you hold now, in the account's currency. Degiro: Wert minus Unrealisierter G/V (€)."),
+    field("First bought (optional)", costDate, "Used for holding periods and tax.")));
   if (kind === "contribution") fields.push(h("div.form.full", field("Amount paid", amount, "Adds to the money invested; set the new fund value with 'Set price'."), field("Date", date)));
   const form = h("form", {
     on: {
