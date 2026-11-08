@@ -40,15 +40,25 @@ export function parseECB(xml) {
   return { date, fx };
 }
 
-/** AMFI NAVAll.txt -> Map(ISIN -> {nav, date}) ; lines: code;ISIN growth;ISIN reinvest;name;NAV;date */
+/**
+ * AMFI NAVAll.txt -> Map(ISIN -> {nav, date}).
+ * Columns are read from the header line, because AMFI changes them (Nov 2026 added "Plan;Option" before the NAV):
+ *   Scheme Code;ISIN Div Payout/ ISIN Growth;ISIN Div Reinvestment;Scheme Name;[Plan;Option;]Net Asset Value;Date
+ */
 export function parseAMFI(txt) {
   const out = new Map();
-  for (const line of txt.split(/\r?\n/)) {
+  const lines = txt.split(/\r?\n/);
+  const head = (lines.find((l) => /net asset value/i.test(l)) || "").split(";").map((s) => s.trim().toLowerCase());
+  const iNav = head.findIndex((s) => s.startsWith("net asset value"));
+  const iDate = head.findIndex((s) => s === "date");
+  for (const line of lines) {
     const p = line.split(";");
     if (p.length < 6) continue;
-    const nav = parseFloat(p[4]);
+    const navCol = iNav >= 0 && p.length === head.length ? iNav : p.length - 2; // fallback: NAV and date are the last two
+    const dateCol = iDate >= 0 && p.length === head.length ? iDate : p.length - 1;
+    const nav = parseFloat(p[navCol]);
     if (!Number.isFinite(nav)) continue;
-    const date = amfiDate(p[5].trim());
+    const date = amfiDate(p[dateCol].trim());
     for (const isin of [p[1].trim(), p[2].trim()]) if (/^[A-Z]{2}[A-Z0-9]{10}$/.test(isin)) out.set(isin, { nav, date });
   }
   return out;
@@ -64,6 +74,15 @@ export function pickSymbol(quotes, preferIndia) {
   const order = preferIndia ? [".NS", ".BO", ...PREF] : PREF;
   const rank = (q) => { const i = order.indexOf(suffix(q.symbol)); return i < 0 ? 99 : i; };
   return ok.sort((a, b) => rank(a) - rank(b))[0]?.symbol || null;
+}
+
+/** OpenFIGI exchange code -> Yahoo suffix (only the exchanges relevant here). */
+const FIGI_EXCH = { GY: ".DE", GR: ".DE", GF: ".F", NA: ".AS", FP: ".PA", IM: ".MI", BB: ".BR", SM: ".MC", AV: ".VI", SW: ".SW", SE: ".SW", LN: ".L", US: "", UN: "", UW: "", UQ: "", UA: "", IS: ".NS", IB: ".BO" };
+/** OpenFIGI mapping response -> Yahoo symbol, preferring the same order as pickSymbol. */
+export function figiToYahoo(data, preferIndia) {
+  const cands = (data || []).filter((d) => d.ticker && d.exchCode in FIGI_EXCH)
+    .map((d) => ({ symbol: d.ticker.replace(/\s+/g, "-").replace(/\/.*$/, "") + FIGI_EXCH[d.exchCode], quoteType: "EQUITY" }));
+  return pickSymbol(cands, preferIndia);
 }
 
 /** Yahoo chart JSON -> {price, ccy, date}; converts pence (GBp) to GBP. */
@@ -123,8 +142,12 @@ async function run(dir) {
   const funds = (wl.items || []).filter((x) => x.isin?.startsWith("INF"));
   if (funds.length) {
     let navs = null;
-    for (const u of ["https://www.amfiindia.com/spages/NAVAll.txt", "https://portal.amfiindia.com/spages/NAVAll.txt"]) {
-      try { navs = parseAMFI(await get(u)); break; } catch (e) { log("AMFI:", e.message); }
+    for (const u of ["https://portal.amfiindia.com/spages/NAVAll.txt", "https://www.amfiindia.com/spages/NAVAll.txt"]) {
+      try {
+        const m = parseAMFI(await get(u));
+        if (m.size > 1000) { navs = m; break; }
+        log(`AMFI: ${u} returned only ${m.size} NAVs, trying the next address`);
+      } catch (e) { log("AMFI:", e.message); }
     }
     for (const f of funds) {
       const n = navs?.get(f.isin);
@@ -142,8 +165,18 @@ async function run(dir) {
       if (!sym && it.isin) {
         const j = await get(`https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(it.isin)}&quotesCount=10&newsCount=0`, { json: true });
         sym = pickSymbol(j.quotes || [], it.isin.startsWith("IN"));
-        if (sym) symbols[key] = sym;
         await sleep(400);
+        if (!sym) { // Yahoo's search doesn't know every ISIN (e.g. some ETCs): ask OpenFIGI (public, no key)
+          try {
+            const res = await fetch("https://api.openfigi.com/v3/mapping", {
+              method: "POST", headers: { "Content-Type": "application/json", "User-Agent": UA },
+              body: JSON.stringify([{ idType: "ID_ISIN", idValue: it.isin }]), signal: AbortSignal.timeout(30000),
+            });
+            if (res.ok) sym = figiToYahoo((await res.json())[0]?.data, it.isin.startsWith("IN"));
+            if (sym) log(`  ${it.isin}: symbol ${sym} via OpenFIGI`);
+          } catch (e) { log(`  openfigi ${it.isin}: ${e.message}`); }
+        }
+        if (sym) symbols[key] = sym;
       }
       if (!sym) throw new Error("no symbol found");
       let q = null;
@@ -188,6 +221,9 @@ function selftest() {
   assert(e.date === "2026-11-06" && Math.abs(e.fx.INR - 1 / 95) < 1e-12, "ECB");
   const a = parseAMFI("Scheme Code;ISIN Div Payout/ ISIN Growth;ISIN Div Reinvestment;Scheme Name;Net Asset Value;Date\n\n119551;INF209KA12Z1;-;Some Fund - Growth;123.4567;06-Nov-2026\n1;INF000000009;;Bad;N.A.;06-Nov-2026");
   assert(a.get("INF209KA12Z1")?.nav === 123.4567 && a.get("INF209KA12Z1").date === "2026-11-06" && !a.has("INF000000009"), "AMFI");
+  const a2 = parseAMFI("Scheme Code;ISIN Div Payout/ ISIN Growth;ISIN Div Reinvestment;Scheme Name;Plan;Option;Net Asset Value;Date\r\n \r\nAxis Mutual Fund\r\n100528;INF090I01DG6;-;Franklin India Corporate Bond Fund;Regular Plan;Growth;107.0500;06-Nov-2026\n127039;INF247L01411;-;Motilal Oswal Midcap Fund;;;102.8412;06-Nov-2026");
+  assert(a2.get("INF090I01DG6")?.nav === 107.05 && a2.get("INF247L01411")?.nav === 102.8412 && a2.get("INF090I01DG6").date === "2026-11-06", "AMFI with Plan/Option columns");
+  assert(figiToYahoo([{ ticker: "4GLD", exchCode: "GY" }, { ticker: "4GLD", exchCode: "GF" }]) === "4GLD.DE", "openfigi xetra");
   assert(pickSymbol([{ symbol: "IWDA.L", quoteType: "ETF" }, { symbol: "EUNL.DE", quoteType: "ETF" }]) === "EUNL.DE", "prefer Xetra");
   assert(pickSymbol([{ symbol: "KTKBANK.BO" }, { symbol: "KTKBANK.NS" }], true) === "KTKBANK.NS", "prefer NSE");
   const y = parseYahooChart({ chart: { result: [{ meta: { regularMarketPrice: 7550, currency: "GBp", regularMarketTime: 1794000000 } }] } });
