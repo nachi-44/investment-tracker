@@ -147,7 +147,7 @@ async function run(dir) {
   const backfill = async (key, fn) => {
     if (backfilled[key]) return;
     try {
-      const rows = await fn();
+      const rows = (await fn()).sort((a, b) => a[0].localeCompare(b[0]));
       if (rows.length) { extra.push(...rows); backfilled[key] = { rows: rows.length, from: rows[0][0], at: out.updated.slice(0, 10) }; }
       log(`  history ${key}: ${rows.length} days` + (rows.length ? ` from ${rows[0][0]}` : ""));
     } catch (e) { log(`  history ${key}: ${e.message}`); }
